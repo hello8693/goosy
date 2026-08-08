@@ -1,7 +1,8 @@
-use anyhow::{Context, Result, bail};
-use skia_safe::{AlphaType, ColorSpace, ColorType, ImageInfo, IPoint, ISize, Surface};
+use anyhow::{Result, bail};
+use skia_safe::{AlphaType, Color, ColorSpace, ColorType, ISize, ImageInfo};
 
-use crate::background;
+use crate::background::BackgroundRenderer;
+use crate::geometry::FrameGeometry;
 use crate::layout::Layout;
 use crate::lrc::LyricLine;
 use crate::lyrics_renderer::LyricsRenderer;
@@ -11,36 +12,76 @@ pub struct Renderer {
     pub height: u32,
     pub fps: u32,
     pub lines: Vec<LyricLine>,
+    geometry: FrameGeometry,
     layout: Layout,
+    background: BackgroundRenderer,
     lyrics: LyricsRenderer,
+    surface: crate::surface::SurfaceRenderer,
+    info: ImageInfo,
+    row_bytes: usize,
 }
 
 impl Renderer {
     pub fn new(width: u32, height: u32, fps: u32, lines: Vec<LyricLine>) -> Result<Self> {
-        if width == 0 || height == 0 || fps == 0 { bail!("width, height, and fps must be positive"); }
-        let lyrics = LyricsRenderer::new(&lines, width, height)?;
-        let layout = Layout::new(&lines, height as f32, lyrics.line_step());
-        Ok(Self { width, height, fps, lines, layout, lyrics })
+        Self::with_background(width, height, fps, lines, BackgroundRenderer::gradient())
+    }
+
+    pub fn with_background(
+        width: u32,
+        height: u32,
+        fps: u32,
+        lines: Vec<LyricLine>,
+        background: BackgroundRenderer,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 || fps == 0 {
+            bail!("width, height, and fps must be positive");
+        }
+        let geometry = FrameGeometry::for_frame(width, height);
+        let lyrics = LyricsRenderer::new(&lines, geometry.lyrics)?;
+        let layout = Layout::new(&lines, geometry.lyrics.height, lyrics.line_step());
+        Ok(Self {
+            width,
+            height,
+            fps,
+            lines,
+            geometry,
+            layout,
+            background,
+            lyrics,
+            surface: crate::surface::SurfaceRenderer::new(),
+            info: ImageInfo::new(
+                ISize::new(width as i32, height as i32),
+                ColorType::RGBA8888,
+                AlphaType::Premul,
+                ColorSpace::new_srgb(),
+            ),
+            row_bytes: width as usize * 4,
+        })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.surface.backend_name()
     }
 
     pub fn render_frame(&mut self, t_ms: u64) -> Result<Vec<u8>> {
-        self.layout.update(&self.lines, t_ms, self.fps);
-        let info = ImageInfo::new(
-            ISize::new(self.width as i32, self.height as i32),
-            ColorType::RGBA8888,
-            AlphaType::Premul,
-            ColorSpace::new_srgb(),
-        );
-        let mut surface = Surface::new_raster(&info, self.width as usize * 4, None)
-            .context("create raster surface")?;
-        let canvas = surface.canvas();
-        background::draw(canvas, self.width, self.height)?;
-        self.lyrics.draw(canvas, &self.lines, &self.layout, t_ms, self.height)?;
-        let mut pixels = vec![0_u8; self.width as usize * self.height as usize * 4];
-        if !surface.read_pixels(&info, &mut pixels, self.width as usize * 4, IPoint::new(0, 0)) {
-            bail!("read RGBA pixels from surface");
-        }
+        let mut pixels = Vec::new();
+        self.render_frame_into(t_ms, &mut pixels)?;
         Ok(pixels)
+    }
+
+    pub fn render_frame_into(&mut self, t_ms: u64, pixels: &mut Vec<u8>) -> Result<()> {
+        self.layout.update(&self.lines, t_ms, self.fps);
+        let geometry = self.geometry;
+        let lines = &self.lines;
+        let layout = &self.layout;
+        let background = &mut self.background;
+        let lyrics = &self.lyrics;
+        self.surface
+            .render_into(&self.info, self.row_bytes, pixels, |canvas| {
+                canvas.clear(Color::BLACK);
+                background.draw(canvas, &geometry, t_ms)?;
+                lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
+            })
     }
 }
 
@@ -51,11 +92,31 @@ mod tests {
     #[test]
     fn settled_lyrics_render_identical_frames() -> Result<()> {
         let lines = vec![
-            LyricLine { start_ms: 0, end_ms: 2_000, text: "Stable line".to_owned(), words: Vec::new() },
-            LyricLine { start_ms: 2_000, end_ms: 4_000, text: "Next line".to_owned(), words: Vec::new() },
+            LyricLine {
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "Stable line".to_owned(),
+                translation: None,
+                agent_id: None,
+                is_duet: false,
+                is_background: false,
+                words: Vec::new(),
+            },
+            LyricLine {
+                start_ms: 2_000,
+                end_ms: 4_000,
+                text: "Next line".to_owned(),
+                translation: None,
+                agent_id: None,
+                is_duet: false,
+                is_background: false,
+                words: Vec::new(),
+            },
         ];
         let mut renderer = Renderer::new(320, 180, 30, lines)?;
-        for _ in 0..180 { renderer.render_frame(1_000)?; }
+        for _ in 0..180 {
+            renderer.render_frame(1_000)?;
+        }
         let first = renderer.render_frame(1_000)?;
         let second = renderer.render_frame(1_000)?;
         assert_eq!(first, second);

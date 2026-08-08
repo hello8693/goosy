@@ -8,6 +8,12 @@ skia-safe = { version = "0.99", features = ["textlayout"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 unicode-segmentation = "1"
+quick-xml = "0.37"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.3", default-features = false }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLCommandBuffer", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLPixelFormat"] }
+skia-safe = { version = "0.99", features = ["metal"] }
 
 [profile.release]
 opt-level = 3

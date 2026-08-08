@@ -8,28 +8,44 @@ fn sample_derivative(a1: f64, a2: f64, t: f64) -> f64 {
 
 pub fn bezier(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
     let x = x.clamp(0.0, 1.0);
-    if x == 0.0 { return 0.0; }
-    if x == 1.0 { return 1.0; }
+    if x == 0.0 {
+        return 0.0;
+    }
+    if x == 1.0 {
+        return 1.0;
+    }
     let mut t = x;
     for _ in 0..8 {
         let error = sample_curve(x1, x2, t) - x;
         let derivative = sample_derivative(x1, x2, t);
-        if derivative.abs() < 1e-7 { break; }
+        if derivative.abs() < 1e-7 {
+            break;
+        }
         t = (t - error / derivative).clamp(0.0, 1.0);
     }
     let mut low = 0.0;
     let mut high = 1.0;
     for _ in 0..24 {
         let current = sample_curve(x1, x2, t);
-        if (current - x).abs() < 1e-8 { break; }
-        if current < x { low = t; } else { high = t; }
+        if (current - x).abs() < 1e-8 {
+            break;
+        }
+        if current < x {
+            low = t;
+        } else {
+            high = t;
+        }
         t = (low + high) * 0.5;
     }
     sample_curve(y1, y2, t).clamp(0.0, 1.0)
 }
 
-pub fn bez_in(x: f64) -> f64 { bezier(0.2, 0.4, 0.58, 1.0, x) }
-pub fn bez_out(x: f64) -> f64 { bezier(0.3, 0.0, 0.58, 1.0, x) }
+pub fn bez_in(x: f64) -> f64 {
+    bezier(0.2, 0.4, 0.58, 1.0, x)
+}
+pub fn bez_out(x: f64) -> f64 {
+    bezier(0.3, 0.0, 0.58, 1.0, x)
+}
 
 #[cfg(test)]
 mod tests {
