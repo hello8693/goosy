@@ -1,0 +1,14 @@
+[package]
+name = "goosy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+skia-safe = { version = "0.99", features = ["textlayout"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+unicode-segmentation = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
