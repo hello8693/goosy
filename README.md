@@ -90,19 +90,19 @@ If the native Node artifact is not present, `render` falls back to the Goosy CLI
 | Option | Default | Description |
 | --- | --- | --- |
 | `song` | required | Source audio file; still required with `--no-audio` for a stable command shape |
-| `lyrics` | required | LRC or TTML/XML lyric file; auto-detected from TTML root `<tt>` (or `.ttml` extension) |
+| `lyrics` | required | LRC, YRC, or TTML/XML lyric file; content is auto-detected and `.yrc` is recognized by the CLI and GUI |
 | `-o, --output` | `out.mp4` | Output MP4 path |
 | `--width` | `1920` | Video width in pixels |
 | `--height` | `1080` | Video height in pixels |
 | `--fps` | `30` | Video frame rate |
-| `--format` | `auto` | Force `auto`, `lrc`, or `ttml` when the input extension/content is ambiguous |
+| `--format` | `auto` | Force `auto`, `lrc`, `yrc`, or `ttml` when the input extension/content is ambiguous |
 | `--background` | embedded cover | Optional wallpaper override; the image is cover-cropped, highly blurred, layered, tinted, and masked for lyric readability |
 | `--cover` | embedded audio artwork | Optional cover override; accepts any image format decodable by Skia and renders a square center crop with rounded corners and shadow |
 | `--no-embedded-cover` | off | Disable automatic embedded artwork extraction when no explicit cover is supplied |
 | `--title`, `--song-name` | none | Song name rendered below the cover, centered and truncated to two lines |
 | `--no-audio` | off | Omit the source audio stream |
 
-Standard LRC timestamps (`[mm:ss]` and `[mm:ss.xx]`), repeated timestamps, metadata tags, and enhanced word timestamps (`<mm:ss.xx>word</mm:ss.xx>`) are accepted. TTML `<p>` lines with `begin`/`end`, timed `<span>` words, inline `ttm:role="x-translation"` translations, and AMLL sidecar translations keyed by `itunes:key` are accepted. Namespaced `xml:begin`/`xml:end` attributes are supported. LRC empty lyric lines remain in the timing/layout model but are not drawn; empty TTML paragraphs are discarded.
+Standard LRC timestamps (`[mm:ss]` and `[mm:ss.xx]`), repeated timestamps, metadata tags, and enhanced word timestamps (`<mm:ss.xx>word</mm:ss.xx>`) are accepted. NetEase YRC lines use `[line_start_ms,line_duration_ms]` with `(word_start_ms,word_duration_ms,flags)word` segments; absolute word starts and durations drive the existing karaoke fill animation. TTML `<p>` lines with `begin`/`end`, timed `<span>` words, inline `ttm:role="x-translation"` translations, and AMLL sidecar translations keyed by `itunes:key` are accepted. Namespaced `xml:begin`/`xml:end` attributes are supported. LRC empty lyric lines remain in the timing/layout model but are not drawn; empty TTML paragraphs are discarded.
 
 ## Layout and background modules
 

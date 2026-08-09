@@ -103,6 +103,7 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
         "auto" => LyricFormat::Auto,
         "lrc" => LyricFormat::Lrc,
         "ttml" | "xml" => LyricFormat::Ttml,
+        "yrc" => LyricFormat::Yrc,
         other => return Err(format!("unsupported lyric format: {other}")),
     };
     Ok(options)
@@ -200,6 +201,7 @@ pub unsafe extern "C" fn goosy_parse_lyrics_json(
             "auto" => LyricFormat::Auto,
             "lrc" => LyricFormat::Lrc,
             "ttml" | "xml" => LyricFormat::Ttml,
+            "yrc" => LyricFormat::Yrc,
             other => return Err(format!("unsupported lyric format: {other}")),
         };
         let lines = parse_lyrics(&input, format).map_err(|error| error.to_string())?;

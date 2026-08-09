@@ -29,7 +29,7 @@ fn configure_chinese_font(context: &egui::Context) {
     context.set_fonts(definitions);
 }
 
-const LYRIC_EXTENSIONS: &[&str] = &["lrc", "ttml", "xml"];
+const LYRIC_EXTENSIONS: &[&str] = &["lrc", "ttml", "xml", "yrc"];
 const COVER_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff", "avif", "heic", "heif",
 ];
@@ -142,7 +142,7 @@ impl GoosyApp {
 
     fn choose_lyrics(&mut self) {
         let Some(path) = FileDialog::new()
-            .add_filter("Lyrics", &["lrc", "ttml", "xml"])
+            .add_filter("Lyrics", &["lrc", "ttml", "xml", "yrc"])
             .pick_file()
         else {
             return;

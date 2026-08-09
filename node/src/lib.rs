@@ -12,6 +12,7 @@ fn format_from_string(format: Option<String>) -> Result<LyricFormat> {
         "auto" => Ok(LyricFormat::Auto),
         "lrc" => Ok(LyricFormat::Lrc),
         "ttml" | "xml" => Ok(LyricFormat::Ttml),
+        "yrc" => Ok(LyricFormat::Yrc),
         other => Err(Error::from_reason(format!(
             "unsupported lyric format: {other}"
         ))),

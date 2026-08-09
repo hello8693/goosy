@@ -11,6 +11,7 @@ pub mod spring;
 pub mod surface;
 pub mod ttml;
 pub mod video;
+pub mod yrc;
 
 pub use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,6 +27,7 @@ pub enum LyricFormat {
     Auto,
     Lrc,
     Ttml,
+    Yrc,
 }
 
 #[derive(Clone, Debug)]
@@ -64,15 +66,12 @@ impl RenderOptions {
 }
 
 pub fn parse_lyrics(input: &str, format: LyricFormat) -> anyhow::Result<Vec<LyricLine>> {
-    let is_ttml = match format {
-        LyricFormat::Auto => ttml::looks_like_ttml(input),
-        LyricFormat::Lrc => false,
-        LyricFormat::Ttml => true,
-    };
-    if is_ttml {
-        ttml::parse_ttml(input)
-    } else {
-        lrc::parse_lrc(input)
+    match format {
+        LyricFormat::Auto if ttml::looks_like_ttml(input) => ttml::parse_ttml(input),
+        LyricFormat::Auto if yrc::looks_like_yrc(input) => yrc::parse_yrc(input),
+        LyricFormat::Auto | LyricFormat::Lrc => lrc::parse_lrc(input),
+        LyricFormat::Ttml => ttml::parse_ttml(input),
+        LyricFormat::Yrc => yrc::parse_yrc(input),
     }
 }
 

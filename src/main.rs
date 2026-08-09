@@ -11,6 +11,7 @@ mod spring;
 mod surface;
 mod ttml;
 mod video;
+mod yrc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -25,6 +26,7 @@ enum LyricFormat {
     Auto,
     Lrc,
     Ttml,
+    Yrc,
 }
 
 #[derive(Parser, Debug)]
@@ -131,23 +133,22 @@ fn render(
             .clone()
             .context("no external lyrics path and no embedded lyrics metadata")?
     };
-    let is_ttml = match format {
-        LyricFormat::Auto => {
-            ttml::looks_like_ttml(&text)
+    let lines = match format {
+        LyricFormat::Auto if ttml::looks_like_ttml(&text) => ttml::parse_ttml(&text)?,
+        LyricFormat::Auto
+            if yrc::looks_like_yrc(&text)
                 || lyrics
                     .as_deref()
                     .and_then(|path| path.extension())
                     .and_then(|extension| extension.to_str())
-                    .map(|extension| extension.eq_ignore_ascii_case("ttml"))
-                    .unwrap_or(false)
+                    .map(|extension| extension.eq_ignore_ascii_case("yrc"))
+                    .unwrap_or(false) =>
+        {
+            yrc::parse_yrc(&text)?
         }
-        LyricFormat::Lrc => false,
-        LyricFormat::Ttml => true,
-    };
-    let lines = if is_ttml {
-        ttml::parse_ttml(&text)?
-    } else {
-        lrc::parse_lrc(&text)?
+        LyricFormat::Auto | LyricFormat::Lrc => lrc::parse_lrc(&text)?,
+        LyricFormat::Ttml => ttml::parse_ttml(&text)?,
+        LyricFormat::Yrc => yrc::parse_yrc(&text)?,
     };
     let last_line_end_ms = lines.iter().map(|line| line.end_ms).max().unwrap_or(0);
     let audio_duration = if no_audio {

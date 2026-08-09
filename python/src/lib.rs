@@ -13,6 +13,7 @@ fn format_from_string(format: &str) -> PyResult<LyricFormat> {
         "auto" => Ok(LyricFormat::Auto),
         "lrc" => Ok(LyricFormat::Lrc),
         "ttml" | "xml" => Ok(LyricFormat::Ttml),
+        "yrc" => Ok(LyricFormat::Yrc),
         other => Err(PyValueError::new_err(format!(
             "unsupported lyric format: {other}"
         ))),
