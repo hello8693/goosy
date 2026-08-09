@@ -41,6 +41,50 @@ Use `--cover cover.png` to override embedded artwork, `--background wallpaper.pn
 
 The repository includes `assets/zoo.flac`, `assets/zoo.ttml`, and `assets/zoo.jpeg` for an end-to-end real-song check.
 
+## Library bindings
+
+The Rust API is available from the package library:
+
+```rust
+use goosy::{render, RenderOptions};
+
+let mut options = RenderOptions::new("song.mp3", "lyrics.mp4");
+options.lyrics = Some("lyrics.ttml".into());
+options.no_audio = false;
+render(&options)?;
+```
+
+Build the native Rust artifacts with `cargo build --release`. This produces `libgoosy.dylib`/`libgoosy.so` and `libgoosy.a`, plus the `include/goosy.h` C ABI. The header-only C++ wrapper is in `cpp/goosy.hpp`; add `cpp/` and `include/` to your include path and link the Rust library.
+
+The Python package uses a direct PyO3 binding rather than ctypes:
+
+```sh
+cd python
+maturin develop --release
+```
+
+```python
+import pygoosy
+
+pygoosy.render("song.mp3", "lyrics.mp4", lyrics="lyrics.ttml")
+lines = pygoosy.parse_lyrics("[00:01.00]Hello", "lrc")
+```
+
+The Node package has a native napi-rs binding. Build and package it with:
+
+```sh
+cargo build --manifest-path node/Cargo.toml --release
+node node/build-native.js
+```
+
+```js
+const { render, parseLyrics } = require("./node/goosy-node");
+render({ song: "song.mp3", lyrics: "lyrics.ttml", output: "lyrics.mp4" });
+const lines = parseLyrics("[00:01.00]Hello", "lrc");
+```
+
+If the native Node artifact is not present, `render` falls back to the Goosy CLI. Set `GOOSY_BIN` when the CLI is not in `target/release` or `PATH`.
+
 ## Parameters
 
 | Option | Default | Description |

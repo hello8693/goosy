@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pygoosy"
+version = "0.1.0"
+description = "Native Python bindings for GoosyRenderer"
+requires-python = ">=3.9"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+bindings = "pyo3"
+module-name = "pygoosy.pygoosy"
+python-source = "pygoosy"

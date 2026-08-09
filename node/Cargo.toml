@@ -1,0 +1,16 @@
+[package]
+name = "goosy-node"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "goosy_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+goosy = { path = ".." }
+napi = { version = "2.16", features = ["napi8"] }
+napi-derive = "2.16"
+
+[build-dependencies]
+napi-build = "2.2"

@@ -1,0 +1,11 @@
+{
+  "name": "goosy-node",
+  "version": "0.1.0",
+  "description": "Native Node.js binding for GoosyRenderer",
+  "main": "index.js",
+  "exports": ".",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build:native": "cargo build --manifest-path ../Cargo.toml --release && node ../build-native.js"
+  }
+}

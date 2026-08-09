@@ -1,0 +1,12 @@
+[package]
+name = "pygoosy"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "pygoosy"
+crate-type = ["cdylib"]
+
+[dependencies]
+goosy = { path = ".." }
+pyo3 = { version = "0.23", features = ["extension-module"] }
