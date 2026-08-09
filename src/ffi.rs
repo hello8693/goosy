@@ -2,12 +2,13 @@ use crate::{LyricFormat, RenderOptions, parse_lyrics, render};
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 
-static LAST_ERROR: OnceLock<Mutex<CString>> = OnceLock::new();
+static LAST_ERROR: LazyLock<Mutex<CString>> =
+    LazyLock::new(|| Mutex::new(CString::new("unknown Goosy error").unwrap()));
 
 fn last_error() -> &'static Mutex<CString> {
-    LAST_ERROR.get_or_init(|| Mutex::new(CString::new("unknown Goosy error").unwrap()))
+    &LAST_ERROR
 }
 
 fn set_error(message: impl Into<String>) {
@@ -136,14 +137,14 @@ fn allocated_string(value: String) -> *mut c_char {
         .unwrap_or_else(|_| CString::new("\\0").unwrap())
         .into_raw()
 }
-
-static VERSION: &[u8] = concat!(
-    env!("CARGO_PKG_NAME"),
-    " ",
-    env!("CARGO_PKG_VERSION"),
-    "\\0"
-)
-.as_bytes();
+static VERSION: LazyLock<CString> = LazyLock::new(|| {
+    CString::new(concat!(
+        env!("CARGO_PKG_NAME"),
+        " ",
+        env!("CARGO_PKG_VERSION")
+    ))
+    .unwrap()
+});
 
 #[unsafe(no_mangle)]
 pub extern "C" fn goosy_version() -> *const c_char {
