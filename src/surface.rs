@@ -3,20 +3,16 @@
 unsafe extern "C" {}
 
 use anyhow::{Context, Result, bail};
-use skia_safe::{Canvas, IPoint, ImageInfo, Surface};
+use skia_safe::{Canvas, IPoint, ImageInfo, Surface, surfaces};
 
 pub struct SurfaceRenderer {
     backend: Backend,
 }
 
 enum Backend {
-    Raster(RasterBackend),
+    Raster,
     #[cfg(target_os = "macos")]
     Metal(MetalBackend),
-}
-
-struct RasterBackend {
-    surface: Option<Surface>,
 }
 
 impl SurfaceRenderer {
@@ -28,25 +24,16 @@ impl SurfaceRenderer {
             };
         }
         Self {
-            backend: Backend::Raster(RasterBackend { surface: None }),
+            backend: Backend::Raster,
         }
     }
 
     pub fn backend_name(&self) -> &'static str {
         match self.backend {
-            Backend::Raster(_) => "raster",
+            Backend::Raster => "raster",
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => "metal",
         }
-    }
-
-    pub fn render<F>(&mut self, info: &ImageInfo, row_bytes: usize, draw: F) -> Result<Vec<u8>>
-    where
-        F: FnOnce(&Canvas) -> Result<()>,
-    {
-        let mut pixels = Vec::new();
-        self.render_into(info, row_bytes, &mut pixels, draw)?;
-        Ok(pixels)
     }
 
     pub fn render_into<F>(
@@ -60,7 +47,7 @@ impl SurfaceRenderer {
         F: FnOnce(&Canvas) -> Result<()>,
     {
         match &mut self.backend {
-            Backend::Raster(raster) => render_raster_into(raster, info, row_bytes, pixels, draw),
+            Backend::Raster => render_raster_into(info, row_bytes, pixels, draw),
             #[cfg(target_os = "macos")]
             Backend::Metal(metal) => metal.render_into(info, row_bytes, pixels, draw),
         }
@@ -68,7 +55,6 @@ impl SurfaceRenderer {
 }
 
 fn render_raster_into<F>(
-    backend: &mut RasterBackend,
     info: &ImageInfo,
     row_bytes: usize,
     pixels: &mut Vec<u8>,
@@ -77,16 +63,11 @@ fn render_raster_into<F>(
 where
     F: FnOnce(&Canvas) -> Result<()>,
 {
-    if backend.surface.is_none() {
-        backend.surface =
-            Some(Surface::new_raster(info, row_bytes, None).context("create raster surface")?);
-    }
-    let surface = backend
-        .surface
-        .as_mut()
-        .expect("raster surface initialized");
+    pixels.resize(info.compute_byte_size(row_bytes), 0);
+    let mut surface = surfaces::wrap_pixels(info, pixels.as_mut_slice(), row_bytes, None)
+        .context("create direct raster surface")?;
     draw(surface.canvas())?;
-    read_pixels_into(surface, info, row_bytes, pixels)
+    Ok(())
 }
 
 fn read_pixels_into(
@@ -151,7 +132,7 @@ impl MetalBackend {
             self.surface = Some(
                 gpu::surfaces::render_target(
                     &mut self.context,
-                    Budgeted::Yes,
+                    Budgeted::No,
                     info,
                     0,
                     SurfaceOrigin::TopLeft,
@@ -164,7 +145,29 @@ impl MetalBackend {
         }
         let surface = self.surface.as_mut().expect("Metal surface initialized");
         draw(surface.canvas())?;
-        self.context.flush_and_submit();
         read_pixels_into(surface, info, row_bytes, pixels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skia_safe::{AlphaType, Color, ColorSpace, ColorType, ISize};
+
+    #[test]
+    fn raster_backend_draws_directly_into_output_buffer() -> Result<()> {
+        let info = ImageInfo::new(
+            ISize::new(2, 1),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            ColorSpace::new_srgb(),
+        );
+        let mut pixels = Vec::new();
+        render_raster_into(&info, 8, &mut pixels, |canvas| {
+            canvas.clear(Color::from_argb(255, 12, 34, 56));
+            Ok(())
+        })?;
+        assert_eq!(pixels, [12, 34, 56, 255, 12, 34, 56, 255]);
+        Ok(())
     }
 }

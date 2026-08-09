@@ -28,7 +28,7 @@ impl FrameGeometry {
             height: height as f32,
         };
         if width > height {
-            let split_x = frame.width / 2.0;
+            let split_x = frame.width * 0.381_966_011_25;
             Self {
                 frame,
                 cover: Some(Viewport {
@@ -59,11 +59,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn landscape_reserves_left_half_for_cover() {
+    fn landscape_uses_golden_ratio_with_larger_lyric_viewport() {
         let geometry = FrameGeometry::for_frame(1920, 1080);
-        assert_eq!(geometry.cover.unwrap().width, 960.0);
-        assert_eq!(geometry.lyrics.x, 960.0);
-        assert_eq!(geometry.lyrics.width, 960.0);
+        let cover_width = 1920.0 * 0.381_966_011_25;
+        assert!((geometry.cover.unwrap().width - cover_width).abs() < 0.01);
+        assert!((geometry.lyrics.x - cover_width).abs() < 0.01);
+        assert!((geometry.lyrics.width - 1920.0 * 0.618_033_988_75).abs() < 0.01);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use std::collections::HashMap;
 
-use crate::lrc::{LyricLine, LyricWord};
+use crate::lrc::{BackgroundVocal, LyricLine, LyricWord};
 
 #[derive(Debug, Default)]
 struct LineBuilder {
@@ -14,6 +14,9 @@ struct LineBuilder {
     text: String,
     translation: Option<String>,
     words: Vec<LyricWord>,
+    background_text: String,
+    background_translation: Option<String>,
+    background_words: Vec<LyricWord>,
 }
 
 #[derive(Debug, Default)]
@@ -23,6 +26,7 @@ struct SpanBuilder {
     text: String,
     ignored: bool,
     translation: bool,
+    background: bool,
     has_child: bool,
 }
 
@@ -39,6 +43,12 @@ fn attr(element: &BytesStart<'_>, wanted: &str) -> Option<String> {
             let key = local_name(attribute.key.as_ref());
             (key == wanted).then(|| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
         })
+}
+
+#[derive(Debug, Clone, Default)]
+struct SidecarEntry {
+    text: String,
+    background_text: String,
 }
 
 fn parse_time(value: Option<&str>) -> Option<u64> {
@@ -102,13 +112,19 @@ fn append_fragment(
     line: &mut Option<LineBuilder>,
     sidecar_target: &Option<String>,
     sidecar_text: &mut String,
+    sidecar_background_depth: usize,
+    sidecar_background_text: &mut String,
 ) {
     let fragment = normalize_fragment(raw);
     if fragment.is_empty() {
         return;
     }
     if sidecar_target.is_some() {
-        sidecar_text.push_str(&fragment);
+        if sidecar_background_depth > 0 {
+            sidecar_background_text.push_str(&fragment);
+        } else {
+            sidecar_text.push_str(&fragment);
+        }
     }
     if let Some(span) = spans.last_mut() {
         span.text.push_str(&fragment);
@@ -122,7 +138,24 @@ fn append_fragment(
     }
 }
 
-fn finalize_line(builder: LineBuilder, sidecar: &HashMap<String, String>) -> Option<LyricLine> {
+fn trim_words_to_text(mut words: Vec<LyricWord>, text: &str) -> Vec<LyricWord> {
+    let mut word_bytes: usize = words.iter().map(|word| word.text.len()).sum();
+    while word_bytes > text.len() {
+        let Some(last) = words.last_mut() else {
+            break;
+        };
+        let Some(character) = last.text.pop() else {
+            words.pop();
+            continue;
+        };
+        word_bytes -= character.len_utf8();
+    }
+    words
+}
+fn finalize_line(
+    builder: LineBuilder,
+    sidecar: &HashMap<String, SidecarEntry>,
+) -> Option<LyricLine> {
     let text = builder.text.trim().to_owned();
     if text.is_empty() {
         return None;
@@ -135,9 +168,19 @@ fn finalize_line(builder: LineBuilder, sidecar: &HashMap<String, String>) -> Opt
         .or(word_end)
         .unwrap_or(start_ms + 5_000)
         .max(start_ms + 1);
-    let translation = builder
-        .translation
-        .or_else(|| builder.id.as_ref().and_then(|id| sidecar.get(id).cloned()));
+    let sidecar_entry = builder.id.as_ref().and_then(|id| sidecar.get(id));
+    let translation = builder.translation.or_else(|| {
+        sidecar_entry
+            .map(|entry| entry.text.clone())
+            .filter(|text| !text.trim().is_empty())
+    });
+    let background_text = if builder.background_text.trim().is_empty() {
+        sidecar_entry
+            .map(|entry| entry.background_text.clone())
+            .unwrap_or_default()
+    } else {
+        builder.background_text.clone()
+    };
     let mut words = if builder.words.is_empty() {
         vec![LyricWord {
             start_ms,
@@ -147,17 +190,31 @@ fn finalize_line(builder: LineBuilder, sidecar: &HashMap<String, String>) -> Opt
     } else {
         builder.words
     };
-    let mut word_bytes: usize = words.iter().map(|word| word.text.len()).sum();
-    while word_bytes > text.len() {
-        let Some(last) = words.last_mut() else {
-            break;
-        };
-        let Some(character) = last.text.pop() else {
-            words.pop();
-            continue;
-        };
-        word_bytes -= character.len_utf8();
-    }
+    words = trim_words_to_text(words, &text);
+    let background_vocal = if background_text.trim().is_empty() {
+        None
+    } else {
+        let background_start = builder
+            .background_words
+            .iter()
+            .map(|word| word.start_ms)
+            .min()
+            .unwrap_or(start_ms);
+        let background_end = builder
+            .background_words
+            .iter()
+            .map(|word| word.end_ms)
+            .max()
+            .unwrap_or(end_ms)
+            .max(background_start + 1);
+        Some(BackgroundVocal {
+            start_ms: background_start,
+            end_ms: background_end,
+            text: background_text.trim().to_owned(),
+            translation: builder.background_translation,
+            words: trim_words_to_text(builder.background_words, &background_text),
+        })
+    };
     Some(LyricLine {
         start_ms,
         end_ms,
@@ -166,6 +223,7 @@ fn finalize_line(builder: LineBuilder, sidecar: &HashMap<String, String>) -> Opt
         agent_id: builder.agent_id,
         is_duet: false,
         is_background: false,
+        background_vocal,
         words,
     })
 }
@@ -193,11 +251,13 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
     let mut current_line: Option<LineBuilder> = None;
     let mut spans: Vec<SpanBuilder> = Vec::new();
     let mut lines = Vec::new();
-    let mut sidecar = HashMap::new();
+    let mut sidecar: HashMap<String, SidecarEntry> = HashMap::new();
     let mut agents: HashMap<String, String> = HashMap::new();
     let mut translation_depth = 0usize;
     let mut sidecar_target: Option<String> = None;
     let mut sidecar_text = String::new();
+    let mut sidecar_background_depth = 0usize;
+    let mut sidecar_background_text = String::new();
 
     loop {
         match reader.read_event().context("read TTML XML event")? {
@@ -217,6 +277,15 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
                 if current_line.is_none() && name == "text" && translation_depth > 0 {
                     sidecar_target = attr(&element, "for");
                     sidecar_text.clear();
+                    sidecar_background_text.clear();
+                    sidecar_background_depth = 0;
+                }
+                if current_line.is_none()
+                    && sidecar_target.is_some()
+                    && name == "span"
+                    && attr(&element, "role").as_deref() == Some("x-bg")
+                {
+                    sidecar_background_depth += 1;
                 }
                 match name {
                     "p" if current_line.is_none() => {
@@ -230,6 +299,8 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
                     }
                     "span" if current_line.is_some() => {
                         let parent_ignored = spans.last().map(|span| span.ignored).unwrap_or(false);
+                        let parent_background =
+                            spans.last().map(|span| span.background).unwrap_or(false);
                         let parent_translation =
                             spans.last().map(|span| span.translation).unwrap_or(false);
                         if let Some(parent) = spans.last_mut() {
@@ -242,6 +313,7 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
                             ignored: parent_ignored || role.as_deref() == Some("x-bg"),
                             translation: parent_translation
                                 || role.as_deref() == Some("x-translation"),
+                            background: parent_background || role.as_deref() == Some("x-bg"),
                             ..SpanBuilder::default()
                         });
                     }
@@ -277,6 +349,8 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
                 &mut current_line,
                 &sidecar_target,
                 &mut sidecar_text,
+                sidecar_background_depth,
+                &mut sidecar_background_text,
             ),
             Event::CData(text) => append_fragment(
                 &String::from_utf8_lossy(text.as_ref()),
@@ -284,18 +358,32 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
                 &mut current_line,
                 &sidecar_target,
                 &mut sidecar_text,
+                sidecar_background_depth,
+                &mut sidecar_background_text,
             ),
             Event::End(element) => {
                 let element_name = element.name();
                 let name = local_name(element_name.as_ref());
                 if name == "text" && current_line.is_none() {
                     if let Some(target) = sidecar_target.take() {
-                        let value = sidecar_text.trim().to_owned();
-                        if !value.is_empty() {
-                            sidecar.insert(target, value);
+                        let entry = SidecarEntry {
+                            text: sidecar_text.trim().to_owned(),
+                            background_text: sidecar_background_text.trim().to_owned(),
+                        };
+                        if !entry.text.is_empty() || !entry.background_text.is_empty() {
+                            sidecar.insert(target, entry);
                         }
                     }
                     sidecar_text.clear();
+                    sidecar_background_text.clear();
+                    sidecar_background_depth = 0;
+                }
+                if name == "span"
+                    && current_line.is_none()
+                    && sidecar_target.is_some()
+                    && sidecar_background_depth > 0
+                {
+                    sidecar_background_depth -= 1;
                 }
                 if name == "translation" && current_line.is_none() {
                     translation_depth = translation_depth.saturating_sub(1);
@@ -304,11 +392,20 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
                     "span" => {
                         if let Some(span) = spans.pop() {
                             if let Some(parent) = spans.last_mut() {
-                                if !span.ignored {
+                                if span.background || !span.ignored {
                                     parent.text.push_str(&span.text);
                                 }
                             } else if let Some(line) = current_line.as_mut() {
-                                if span.translation {
+                                if span.background {
+                                    if span.translation {
+                                        let value = span.text.trim();
+                                        if !value.is_empty() {
+                                            line.background_translation = Some(value.to_owned());
+                                        }
+                                    } else {
+                                        line.background_text.push_str(&span.text);
+                                    }
+                                } else if span.translation {
                                     let value = span.text.trim();
                                     if !value.is_empty() {
                                         line.translation = Some(value.to_owned());
@@ -317,16 +414,21 @@ pub fn parse_ttml(input: &str) -> Result<Vec<LyricLine>> {
                                     line.text.push_str(&span.text);
                                 }
                             }
-                            if !span.ignored && !span.translation && !span.has_child {
+                            if !span.translation && !span.has_child {
                                 if let (Some(start_ms), Some(end_ms)) = (span.begin_ms, span.end_ms)
                                 {
                                     if !span.text.trim().is_empty() {
                                         if let Some(line) = current_line.as_mut() {
-                                            line.words.push(LyricWord {
+                                            let word = LyricWord {
                                                 start_ms,
                                                 end_ms: end_ms.max(start_ms + 1),
                                                 text: span.text,
-                                            });
+                                            };
+                                            if span.background {
+                                                line.background_words.push(word);
+                                            } else if !span.ignored {
+                                                line.words.push(word);
+                                            }
                                         }
                                     }
                                 }
@@ -434,11 +536,23 @@ mod tests {
     }
 
     #[test]
-    fn excludes_background_vocal_words() {
+    fn parses_background_vocal_without_mixing_main_line() {
         let input = r#"<tt><body><p begin="1s" end="3s"><span begin="1s" end="2s">main </span><span ttm:role="x-bg"><span begin="2s" end="3s">background</span></span></p></body></tt>"#;
         let lines = parse_ttml(input).unwrap();
         assert_eq!(lines[0].text, "main");
         assert_eq!(lines[0].words.len(), 1);
+        let background = lines[0].background_vocal.as_ref().unwrap();
+        assert_eq!(background.text, "background");
+        assert_eq!(background.words.len(), 1);
+        assert_eq!(background.words[0].start_ms, 2_000);
+    }
+
+    #[test]
+    fn parses_sidecar_background_vocal() {
+        let input = r#"<tt><head><metadata><iTunesMetadata><translations><translation><text for="L1">译文 <span ttm:role="x-bg">(伴唱)</span></text></translation></translations></iTunesMetadata></metadata></head><body><p begin="1s" end="3s" itunes:key="L1">main</p></body></tt>"#;
+        let lines = parse_ttml(input).unwrap();
+        assert_eq!(lines[0].translation.as_deref(), Some("译文"));
+        assert_eq!(lines[0].background_vocal.as_ref().unwrap().text, "(伴唱)");
     }
 
     #[test]

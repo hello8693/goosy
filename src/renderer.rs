@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use skia_safe::{AlphaType, Color, ColorSpace, ColorType, ISize, ImageInfo};
 
 use crate::background::BackgroundRenderer;
+use crate::cover_renderer::CoverRenderer;
 use crate::geometry::FrameGeometry;
 use crate::layout::Layout;
 use crate::lrc::LyricLine;
@@ -15,6 +16,7 @@ pub struct Renderer {
     geometry: FrameGeometry,
     layout: Layout,
     background: BackgroundRenderer,
+    cover: Option<CoverRenderer>,
     lyrics: LyricsRenderer,
     surface: crate::surface::SurfaceRenderer,
     info: ImageInfo,
@@ -23,7 +25,7 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(width: u32, height: u32, fps: u32, lines: Vec<LyricLine>) -> Result<Self> {
-        Self::with_background(width, height, fps, lines, BackgroundRenderer::gradient())
+        Self::with_background(width, height, fps, lines, BackgroundRenderer::dynamic())
     }
 
     pub fn with_background(
@@ -33,12 +35,29 @@ impl Renderer {
         lines: Vec<LyricLine>,
         background: BackgroundRenderer,
     ) -> Result<Self> {
+        Self::with_scene(width, height, fps, lines, background, None)
+    }
+
+    pub fn with_scene(
+        width: u32,
+        height: u32,
+        fps: u32,
+        lines: Vec<LyricLine>,
+        background: BackgroundRenderer,
+        cover: Option<CoverRenderer>,
+    ) -> Result<Self> {
         if width == 0 || height == 0 || fps == 0 {
             bail!("width, height, and fps must be positive");
         }
         let geometry = FrameGeometry::for_frame(width, height);
         let lyrics = LyricsRenderer::new(&lines, geometry.lyrics)?;
-        let layout = Layout::new(&lines, geometry.lyrics.height, lyrics.line_step());
+        let layout = Layout::new(
+            &lines,
+            geometry.lyrics.height,
+            lyrics.group_heights(),
+            lyrics.group_gap(),
+            lyrics.interlude_slot_height(),
+        );
         Ok(Self {
             width,
             height,
@@ -47,6 +66,7 @@ impl Renderer {
             geometry,
             layout,
             background,
+            cover,
             lyrics,
             surface: crate::surface::SurfaceRenderer::new(),
             info: ImageInfo::new(
@@ -75,11 +95,15 @@ impl Renderer {
         let lines = &self.lines;
         let layout = &self.layout;
         let background = &mut self.background;
+        let cover = &mut self.cover;
         let lyrics = &self.lyrics;
         self.surface
             .render_into(&self.info, self.row_bytes, pixels, |canvas| {
                 canvas.clear(Color::BLACK);
                 background.draw(canvas, &geometry, t_ms)?;
+                if let Some(cover) = cover {
+                    cover.draw(canvas, &geometry)?;
+                }
                 lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
             })
     }
@@ -100,6 +124,7 @@ mod tests {
                 agent_id: None,
                 is_duet: false,
                 is_background: false,
+                background_vocal: None,
                 words: Vec::new(),
             },
             LyricLine {
@@ -110,6 +135,7 @@ mod tests {
                 agent_id: None,
                 is_duet: false,
                 is_background: false,
+                background_vocal: None,
                 words: Vec::new(),
             },
         ];

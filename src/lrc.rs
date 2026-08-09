@@ -1,12 +1,22 @@
 use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundVocal {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+    pub translation: Option<String>,
+    pub words: Vec<LyricWord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LyricWord {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LyricLine {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -15,7 +25,22 @@ pub struct LyricLine {
     pub agent_id: Option<String>,
     pub is_duet: bool,
     pub is_background: bool,
+    pub background_vocal: Option<BackgroundVocal>,
     pub words: Vec<LyricWord>,
+}
+
+/// The visual scan completion moment used to coordinate pre-roll scrolling.
+/// Untimed line-level karaoke finishes slightly before the nominal line end,
+/// leaving a short handoff window before the next line.
+pub fn scan_end_ms(line: &LyricLine) -> u64 {
+    if let Some(end_ms) = line.words.iter().map(|word| word.end_ms).max() {
+        return end_ms.max(line.start_ms + 1);
+    }
+    let duration = line.end_ms.saturating_sub(line.start_ms);
+    let lead = (duration / 8)
+        .clamp(120, 400)
+        .min(duration.saturating_sub(1));
+    line.end_ms.saturating_sub(lead).max(line.start_ms + 1)
 }
 
 fn parse_timestamp(value: &str) -> Option<u64> {
@@ -122,6 +147,7 @@ pub fn parse_lrc(input: &str) -> Result<Vec<LyricLine>> {
                 agent_id: None,
                 is_duet: false,
                 is_background: false,
+                background_vocal: None,
                 words: words.clone(),
             });
         }
@@ -163,6 +189,13 @@ mod tests {
         assert_eq!(lines[0].start_ms, 1_000);
         assert_eq!(lines[1].start_ms, 3_000);
         assert_eq!(lines[0].end_ms, 3_000);
+    }
+
+    #[test]
+    fn untimed_scan_finishes_before_nominal_line_end() {
+        let lines = parse_lrc("[00:00.00]first\n[00:02.00]second\n").unwrap();
+        assert_eq!(scan_end_ms(&lines[0]), 1_750);
+        assert!(scan_end_ms(&lines[0]) < lines[1].start_ms);
     }
 
     #[test]

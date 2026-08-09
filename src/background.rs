@@ -9,6 +9,9 @@ use skia_safe::{
     AlphaType, Canvas, Color, ColorSpace, ColorType, Data, IPoint, ISize, Image, ImageFilter,
     ImageInfo, Paint, Point, Rect, TileMode,
 };
+
+const BACKGROUND_ZOOM: f32 = 1.45;
+const BACKGROUND_BLUR_SIGMA: f32 = 96.0;
 use std::path::Path;
 
 pub trait BackgroundLayer {
@@ -20,21 +23,34 @@ pub struct BackgroundRenderer {
 }
 
 impl BackgroundRenderer {
-    pub fn gradient() -> Self {
+    pub fn dynamic() -> Self {
         let mut renderer = Self { layers: Vec::new() };
         renderer.add_layer(GradientLayer);
         renderer.add_layer(FallbackMaskLayer);
         renderer
     }
 
+    pub fn gradient() -> Self {
+        Self::dynamic()
+    }
+
     pub fn from_image_path(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("read background image {}", path.display()))?;
+        Self::from_image_bytes(&bytes).context("decode background image")
+    }
+
+    pub fn from_image_bytes(bytes: &[u8]) -> Result<Self> {
         let image =
-            Image::from_encoded(Data::new_copy(&bytes)).context("decode background image")?;
+            Image::from_encoded(Data::new_copy(bytes)).context("decode background image")?;
         let sampled_color = sample_image_color(&image).unwrap_or((32, 32, 40));
-        let blur_filter = image_filters::blur((12.0, 12.0), TileMode::Clamp, None, None)
-            .context("create background blur filter")?;
+        let blur_filter = image_filters::blur(
+            (BACKGROUND_BLUR_SIGMA, BACKGROUND_BLUR_SIGMA),
+            TileMode::Clamp,
+            None,
+            None,
+        )
+        .context("create background blur filter")?;
         let mut renderer = Self { layers: Vec::new() };
         renderer.add_layer(ImageLayer {
             image,
@@ -154,7 +170,7 @@ impl BackgroundLayer for ImageLayer {
             geometry.frame.width,
             geometry.frame.height,
         );
-        let scale = (dst.width() / iw).max(dst.height() / ih) * 1.08;
+        let scale = (dst.width() / iw).max(dst.height() / ih) * BACKGROUND_ZOOM;
         let visible_w = dst.width() / scale;
         let visible_h = dst.height() / scale;
         let drift = (t_ms as f32 / 8_000.0).sin() * (iw - visible_w).max(0.0) * 0.25;
@@ -164,17 +180,31 @@ impl BackgroundLayer for ImageLayer {
             visible_w.min(iw),
             visible_h.min(ih),
         );
-        let mut paint = Paint::default();
-        paint.set_image_filter(self.blur_filter.clone());
-        canvas.draw_image_rect(
-            &self.image,
-            Some((&src, SrcRectConstraint::Strict)),
-            &dst,
-            &paint,
-        );
+        let center = Point::new(dst.center_x(), dst.center_y());
+        let phase = t_ms as f32 / 9_000.0;
+        let passes = [
+            (0.0, 1.0, 0.80),
+            ((phase * 1.7).sin() * 4.0 - 2.0, 1.08, 0.20),
+        ];
+        for (angle, pass_scale, alpha) in passes {
+            let saved = canvas.save();
+            canvas.rotate(angle, Some(center));
+            canvas.scale((pass_scale, pass_scale));
+            let mut paint = Paint::default();
+            paint
+                .set_alpha_f(alpha)
+                .set_image_filter(self.blur_filter.clone());
+            canvas.draw_image_rect(
+                &self.image,
+                Some((&src, SrcRectConstraint::Strict)),
+                &dst,
+                &paint,
+            );
+            canvas.restore_to_count(saved);
+        }
         let mut tint = Paint::default();
         tint.set_color(Color::from_argb(
-            26,
+            36,
             self.sampled_color.0,
             self.sampled_color.1,
             self.sampled_color.2,
