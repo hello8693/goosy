@@ -2,3 +2,6 @@
 **/*.mp3
 **/*.mp4
 **/*.flac
+
+**/target/
+**/__pycache__/
