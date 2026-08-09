@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -104,6 +104,33 @@ fn main() -> Result<()> {
     }
 }
 
+fn parse_lyrics_text(
+    text: &str,
+    lyrics: Option<&Path>,
+    format: LyricFormat,
+) -> Result<Vec<lrc::LyricLine>> {
+    let extension = lyrics
+        .and_then(Path::extension)
+        .and_then(|extension| extension.to_str());
+    match format {
+        LyricFormat::Auto
+            if ttml::looks_like_ttml(text)
+                || extension.is_some_and(|value| value.eq_ignore_ascii_case("ttml")) =>
+        {
+            ttml::parse_ttml(text)
+        }
+        LyricFormat::Auto
+            if yrc::looks_like_yrc(text)
+                || extension.is_some_and(|value| value.eq_ignore_ascii_case("yrc")) =>
+        {
+            yrc::parse_yrc(text)
+        }
+        LyricFormat::Auto | LyricFormat::Lrc => lrc::parse_lrc(text),
+        LyricFormat::Ttml => ttml::parse_ttml(text),
+        LyricFormat::Yrc => yrc::parse_yrc(text),
+    }
+}
+
 fn render(
     song: PathBuf,
     lyrics: Option<PathBuf>,
@@ -133,23 +160,7 @@ fn render(
             .clone()
             .context("no external lyrics path and no embedded lyrics metadata")?
     };
-    let lines = match format {
-        LyricFormat::Auto if ttml::looks_like_ttml(&text) => ttml::parse_ttml(&text)?,
-        LyricFormat::Auto
-            if yrc::looks_like_yrc(&text)
-                || lyrics
-                    .as_deref()
-                    .and_then(|path| path.extension())
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| extension.eq_ignore_ascii_case("yrc"))
-                    .unwrap_or(false) =>
-        {
-            yrc::parse_yrc(&text)?
-        }
-        LyricFormat::Auto | LyricFormat::Lrc => lrc::parse_lrc(&text)?,
-        LyricFormat::Ttml => ttml::parse_ttml(&text)?,
-        LyricFormat::Yrc => yrc::parse_yrc(&text)?,
-    };
+    let lines = parse_lyrics_text(&text, lyrics.as_deref(), format)?;
     let last_line_end_ms = lines.iter().map(|line| line.end_ms).max().unwrap_or(0);
     let audio_duration = if no_audio {
         0.0
@@ -224,4 +235,17 @@ fn render(
     writer.finish()?;
     progress.finish_with_message(format!("Rendered {}", output.display()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_uses_ttml_extension_fallback() {
+        let input = r#"<body><p begin="1s" end="2s">hello</p></body>"#;
+        let lines =
+            parse_lyrics_text(input, Some(Path::new("lyrics.ttml")), LyricFormat::Auto).unwrap();
+        assert_eq!(lines[0].text, "hello");
+    }
 }

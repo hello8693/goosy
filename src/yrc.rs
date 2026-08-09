@@ -62,13 +62,7 @@ pub fn looks_like_yrc(input: &str) -> bool {
     input
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .find(|line| {
-            !line.starts_with("[ti:") && !line.starts_with("[ar:") && !line.starts_with("[al:")
-        })
-        .and_then(line_header)
-        .map(|(_, _, text)| next_word_tag(text, 0).is_some())
-        .unwrap_or(false)
+        .any(|line| line_header(line).is_some_and(|(_, _, content)| !content.is_empty()))
 }
 
 pub fn parse_yrc(input: &str) -> Result<Vec<LyricLine>> {
@@ -138,6 +132,18 @@ mod tests {
     fn detects_yrc_without_confusing_lrc() {
         assert!(looks_like_yrc("[1000,500](1000,500,0)hello"));
         assert!(!looks_like_yrc("[00:01.00]hello"));
+    }
+
+    #[test]
+    fn detects_yrc_after_metadata() {
+        assert!(looks_like_yrc(
+            "[by:artist]\n[id:123]\n[1000,500](1000,500,0)hello"
+        ));
+    }
+
+    #[test]
+    fn detects_yrc_without_word_tags() {
+        assert!(looks_like_yrc("[1000,500]hello"));
     }
 
     #[test]
