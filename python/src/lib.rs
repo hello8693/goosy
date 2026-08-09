@@ -1,4 +1,4 @@
-use goosy::{LyricFormat, RenderOptions};
+use libgoosy::{LyricFormat, RenderOptions};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -47,14 +47,14 @@ fn render(
     options.no_embedded_cover = no_embedded_cover;
     options.no_audio = no_audio;
     options.format = format_from_string(format)?;
-    goosy::render(&options).map_err(error)
+    libgoosy::render(&options).map_err(error)
 }
 
 fn words<'py>(
     py: Python<'py>,
     output: &Bound<'py, PyDict>,
     key: &str,
-    source: &[goosy::LyricWord],
+    source: &[libgoosy::LyricWord],
 ) -> PyResult<()> {
     let list = PyList::empty(py);
     for word in source {
@@ -67,7 +67,7 @@ fn words<'py>(
     output.set_item(key, list)
 }
 
-fn line_to_py<'py>(py: Python<'py>, line: &goosy::LyricLine) -> PyResult<Py<PyAny>> {
+fn line_to_py<'py>(py: Python<'py>, line: &libgoosy::LyricLine) -> PyResult<Py<PyAny>> {
     let output = PyDict::new(py);
     output.set_item("start_ms", line.start_ms)?;
     output.set_item("end_ms", line.end_ms)?;
@@ -94,7 +94,7 @@ fn line_to_py<'py>(py: Python<'py>, line: &goosy::LyricLine) -> PyResult<Py<PyAn
 #[pyfunction]
 #[pyo3(signature = (input, format="auto"))]
 fn parse_lyrics(py: Python<'_>, input: &str, format: &str) -> PyResult<Py<PyAny>> {
-    let lines = goosy::parse_lyrics(input, format_from_string(format)?).map_err(error)?;
+    let lines = libgoosy::parse_lyrics(input, format_from_string(format)?).map_err(error)?;
     let output = PyList::empty(py);
     for line in &lines {
         output.append(line_to_py(py, line)?)?;

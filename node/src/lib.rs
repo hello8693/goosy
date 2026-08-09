@@ -1,4 +1,4 @@
-use goosy::{LyricFormat, RenderOptions as RustRenderOptions};
+use libgoosy::{LyricFormat, RenderOptions as RustRenderOptions};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ pub struct LyricLine {
     pub words: Vec<Word>,
 }
 
-fn word(word: &goosy::LyricWord) -> Word {
+fn word(word: &libgoosy::LyricWord) -> Word {
     Word {
         start_ms: word.start_ms as i64,
         end_ms: word.end_ms as i64,
@@ -72,7 +72,7 @@ fn word(word: &goosy::LyricWord) -> Word {
     }
 }
 
-fn line(line: &goosy::LyricLine) -> LyricLine {
+fn line(line: &libgoosy::LyricLine) -> LyricLine {
     LyricLine {
         start_ms: line.start_ms as i64,
         end_ms: line.end_ms as i64,
@@ -108,12 +108,12 @@ pub fn render(options: RenderOptions) -> Result<()> {
     rust.no_embedded_cover = options.no_embedded_cover.unwrap_or(false);
     rust.no_audio = options.no_audio.unwrap_or(false);
     rust.format = format_from_string(options.format)?;
-    goosy::render(&rust).map_err(|error| Error::from_reason(error.to_string()))
+    libgoosy::render(&rust).map_err(|error| Error::from_reason(error.to_string()))
 }
 
 #[napi]
 pub fn parse_lyrics(input: String, format: Option<String>) -> Result<Vec<LyricLine>> {
-    let lines = goosy::parse_lyrics(&input, format_from_string(format)?)
+    let lines = libgoosy::parse_lyrics(&input, format_from_string(format)?)
         .map_err(|error| Error::from_reason(error.to_string()))?;
     Ok(lines.iter().map(line).collect())
 }

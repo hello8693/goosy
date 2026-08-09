@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "goosy"
+name = "libgoosy"
 crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
 skia-safe = { version = "0.99", features = ["textlayout"] }

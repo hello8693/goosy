@@ -46,7 +46,7 @@ The repository includes `assets/zoo.flac`, `assets/zoo.ttml`, and `assets/zoo.jp
 The Rust API is available from the package library:
 
 ```rust
-use goosy::{render, RenderOptions};
+use libgoosy::{render, RenderOptions};
 
 let mut options = RenderOptions::new("song.mp3", "lyrics.mp4");
 options.lyrics = Some("lyrics.ttml".into());
