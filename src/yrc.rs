@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn parses_repository_yrc_fixture() {
-        let lines = parse_yrc(include_str!("../assets/Heal the World.yrc")).unwrap();
+        let lines = parse_yrc(include_str!("../testdata/Heal the World.yrc")).unwrap();
         assert_eq!(lines.len(), 94);
         assert_eq!(lines[0].start_ms, 21_950);
         assert_eq!(lines[0].words[4].text, "Monologue");
