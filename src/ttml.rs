@@ -65,12 +65,17 @@ fn parse_time(value: Option<&str>) -> Option<u64> {
             .ok()
             .map(|seconds| (seconds * 1_000.0).round() as u64);
     }
-    let parts: Vec<_> = value.split(':').collect();
-    let seconds = match parts.as_slice() {
-        [seconds] => seconds.parse::<f64>().ok()?,
-        [minutes, seconds] => minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?,
-        [hours, minutes, seconds] => {
-            hours.parse::<f64>().ok()? * 3_600.0
+    let mut parts = value.split(':');
+    let first = parts.next()?;
+    let second = parts.next();
+    let third = parts.next();
+    let seconds = match (second, third, parts.next()) {
+        (None, None, None) => first.parse::<f64>().ok()?,
+        (Some(seconds), None, None) => {
+            first.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?
+        }
+        (Some(minutes), Some(seconds), None) => {
+            first.parse::<f64>().ok()? * 3_600.0
                 + minutes.parse::<f64>().ok()? * 60.0
                 + seconds.parse::<f64>().ok()?
         }

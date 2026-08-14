@@ -10,29 +10,41 @@ pub struct Spring {
     from: f64,
     velocity: f64,
     initial_velocity: f64,
+    overdamped: bool,
+    delta: f64,
+    af: f64,
+    leftover: f64,
+    dfm: f64,
+    dm: f64,
 }
 
-fn solve_spring(
-    from: f64,
-    velocity: f64,
-    to: f64,
-    stiffness: f64,
-    damping: f64,
-    mass: f64,
-    soft: bool,
-    t: f64,
-) -> f64 {
-    let delta = to - from;
-    if soft || damping >= 2.0 * (stiffness * mass).sqrt() {
-        let af = -(stiffness / mass).sqrt();
-        let leftover = -af * delta - velocity;
-        to - (delta + t * leftover) * (t * af).exp()
-    } else {
-        let df = (4.0 * mass * stiffness - damping * damping).sqrt();
-        let leftover = (damping * delta - 2.0 * mass * velocity) / df;
-        let dfm = df / (2.0 * mass);
-        let dm = -damping / (2.0 * mass);
-        to - ((t * dfm).cos() * delta + (t * dfm).sin() * leftover) * (t * dm).exp()
+impl Spring {
+    fn recompute_solution(&mut self) {
+        self.delta = self.target_position - self.from;
+        self.overdamped = self.soft || self.damping >= 2.0 * (self.stiffness * self.mass).sqrt();
+        if self.overdamped {
+            self.af = -(self.stiffness / self.mass).sqrt();
+            self.leftover = -self.af * self.delta - self.initial_velocity;
+            self.dfm = 0.0;
+            self.dm = 0.0;
+        } else {
+            let df = (4.0 * self.mass * self.stiffness - self.damping * self.damping).sqrt();
+            self.leftover =
+                (self.damping * self.delta - 2.0 * self.mass * self.initial_velocity) / df;
+            self.dfm = df / (2.0 * self.mass);
+            self.dm = -self.damping / (2.0 * self.mass);
+            self.af = 0.0;
+        }
+    }
+
+    fn sample(&self, time: f64) -> f64 {
+        if self.overdamped {
+            self.target_position - (self.delta + time * self.leftover) * (time * self.af).exp()
+        } else {
+            self.target_position
+                - ((time * self.dfm).cos() * self.delta + (time * self.dfm).sin() * self.leftover)
+                    * (time * self.dm).exp()
+        }
     }
 }
 
@@ -48,7 +60,7 @@ impl Spring {
         mass: f64,
         soft: bool,
     ) -> Self {
-        Self {
+        let mut spring = Self {
             current_position: position,
             target_position: position,
             stiffness,
@@ -59,8 +71,17 @@ impl Spring {
             soft,
             time: 0.0,
             from: position,
-        }
+            overdamped: false,
+            delta: 0.0,
+            af: 0.0,
+            leftover: 0.0,
+            dfm: 0.0,
+            dm: 0.0,
+        };
+        spring.recompute_solution();
+        spring
     }
+
     pub fn set_parameters(&mut self, stiffness: f64, damping: f64, mass: f64, soft: bool) {
         self.stiffness = stiffness;
         self.damping = damping;
@@ -69,6 +90,7 @@ impl Spring {
         self.from = self.current_position;
         self.initial_velocity = self.velocity;
         self.time = 0.0;
+        self.recompute_solution();
     }
 
     pub fn set_position(&mut self, position: f64) {
@@ -88,6 +110,7 @@ impl Spring {
         self.from = self.current_position;
         self.initial_velocity = self.velocity;
         self.time = 0.0;
+        self.recompute_solution();
     }
 
     pub fn update(&mut self, dt: f64) {
@@ -112,19 +135,6 @@ impl Spring {
 
     pub fn current_velocity(&self) -> f64 {
         self.velocity
-    }
-
-    fn sample(&self, time: f64) -> f64 {
-        solve_spring(
-            self.from,
-            self.initial_velocity,
-            self.target_position,
-            self.stiffness,
-            self.damping,
-            self.mass,
-            self.soft,
-            time,
-        )
     }
 }
 

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::LazyLock;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct AudioMetadata {
@@ -86,12 +87,19 @@ pub fn embedded_cover_image(song: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(output.stdout))
 }
 
-fn encoder_available(name: &str) -> bool {
+static FFMPEG_ENCODERS: LazyLock<Option<String>> = LazyLock::new(|| {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).contains(name))
-        .unwrap_or(false)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+});
+
+fn encoder_available(name: &str) -> bool {
+    FFMPEG_ENCODERS
+        .as_deref()
+        .is_some_and(|encoders| encoders.contains(name))
 }
 
 #[cfg(target_os = "macos")]
@@ -103,7 +111,37 @@ fn preferred_hardware_encoder() -> Option<&'static str> {
 fn preferred_hardware_encoder() -> Option<&'static str> {
     ["h264_nvenc", "h264_amf", "h264_qsv"]
         .into_iter()
-        .find(|encoder| encoder_available(encoder))
+        .find(|encoder| windows_encoder_usable(encoder))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_encoder_usable(encoder: &str) -> bool {
+    if !encoder_available(encoder) {
+        return false;
+    }
+    // FFmpeg listing an encoder only proves that the build contains its wrapper.
+    // Actually open it once so missing drivers (for example nvcuda.dll) fall
+    // back to libx264 before the real raw-video pipe consumes any frames.
+    Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=0.04",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            encoder,
+            "-f",
+            "null",
+            "-",
+        ])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -179,7 +217,10 @@ impl VideoWriter {
         command
             .arg(output)
             .stdin(Stdio::piped())
-            .stderr(Stdio::piped());
+            // Never pipe FFmpeg stderr without a concurrent drain: on Windows
+            // encoder diagnostics can fill the pipe before the first frame,
+            // making the writer wait forever at GUI 0%.
+            .stderr(Stdio::inherit());
         let command_display = format!("{command:?}");
         let mut child = command
             .spawn()
@@ -233,5 +274,96 @@ impl VideoWriter {
             );
         }
         Ok(())
+    }
+}
+
+const FRAME_QUEUE_CAPACITY: usize = 3;
+
+/// Sends rendered frames to FFmpeg without making the render thread perform the
+/// blocking pipe write. The queue is intentionally bounded to cap memory use and
+/// preserve backpressure when encoding cannot keep up.
+pub struct AsyncVideoWriter {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    recycled: std::sync::mpsc::Receiver<Vec<u8>>,
+    worker: Option<std::thread::JoinHandle<Result<()>>>,
+    frame_size: usize,
+}
+
+impl AsyncVideoWriter {
+    pub fn new(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+    ) -> Result<Self> {
+        let writer = VideoWriter::new(output, width, height, fps, audio)?;
+        let frame_size = width as usize * height as usize * 4;
+        let (sender, frames) = std::sync::mpsc::sync_channel::<Vec<u8>>(FRAME_QUEUE_CAPACITY);
+        let (recycle_sender, recycled) =
+            std::sync::mpsc::sync_channel::<Vec<u8>>(FRAME_QUEUE_CAPACITY + 1);
+        for _ in 0..=FRAME_QUEUE_CAPACITY {
+            recycle_sender
+                .send(vec![0; frame_size])
+                .expect("recycle channel capacity matches initial buffers");
+        }
+        let worker = std::thread::Builder::new()
+            .name("ffmpeg-writer".to_owned())
+            .spawn(move || {
+                let mut writer = writer;
+                for frame in frames {
+                    let write_result = writer.write_frame(&frame);
+                    // The render thread drains this opportunistically while it is
+                    // producing frames. During finish no receiver is active, so
+                    // never let recycling block the encoder worker.
+                    let _ = recycle_sender.try_send(frame);
+                    write_result?;
+                }
+                writer.finish()
+            })
+            .context("spawn ffmpeg writer thread")?;
+        Ok(Self {
+            sender: Some(sender),
+            recycled,
+            worker: Some(worker),
+            frame_size,
+        })
+    }
+
+    pub fn submit_frame(&mut self, pixels: &mut Vec<u8>) -> Result<()> {
+        if pixels.len() != self.frame_size {
+            bail!(
+                "invalid frame size: expected {}, got {}",
+                self.frame_size,
+                pixels.len()
+            );
+        }
+        let frame = std::mem::take(pixels);
+        let sender = self
+            .sender
+            .as_ref()
+            .context("video writer is already finished")?;
+        if let Err(error) = sender.send(frame) {
+            *pixels = error.0;
+            self.sender.take();
+            bail!("send frame to ffmpeg writer: worker stopped")
+        }
+        *pixels = self
+            .recycled
+            .recv()
+            .context("ffmpeg writer stopped before recycling a frame")?;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.sender.take();
+        let worker = self
+            .worker
+            .take()
+            .context("ffmpeg writer already finished")?;
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => bail!("ffmpeg writer thread panicked"),
+        }
     }
 }

@@ -13,11 +13,15 @@ use crate::geometry::FrameGeometry;
 
 pub struct CoverRenderer {
     image: Image,
+    source: Rect,
     title: Option<String>,
     title_paragraph: Option<Paragraph>,
     title_layout_width: f32,
     shadow_filter: Option<MaskFilter>,
     shadow_sigma: f32,
+    shadow_paint: Paint,
+    image_paint: Paint,
+    border_paint: Paint,
 }
 
 impl CoverRenderer {
@@ -29,13 +33,37 @@ impl CoverRenderer {
 
     pub fn from_bytes(bytes: &[u8], title: Option<String>) -> Result<Self> {
         let image = Image::from_encoded(Data::new_copy(bytes)).context("decode cover image")?;
+        let image_width = image.width() as f32;
+        let image_height = image.height() as f32;
+        let crop_side = image_width.min(image_height);
+        let source = Rect::from_xywh(
+            (image_width - crop_side) * 0.5,
+            (image_height - crop_side) * 0.5,
+            crop_side,
+            crop_side,
+        );
+        let mut shadow_paint = Paint::default();
+        shadow_paint
+            .set_anti_alias(true)
+            .set_color(Color::from_argb(120, 0, 0, 0));
+        let mut image_paint = Paint::default();
+        image_paint.set_anti_alias(true);
+        let mut border_paint = Paint::default();
+        border_paint
+            .set_anti_alias(true)
+            .set_style(PaintStyle::Stroke)
+            .set_color(Color::from_argb(38, 255, 255, 255));
         Ok(Self {
             image,
+            source,
             title: title.filter(|title| !title.trim().is_empty()),
             title_paragraph: None,
             title_layout_width: 0.0,
             shadow_filter: None,
             shadow_sigma: 0.0,
+            shadow_paint,
+            image_paint,
+            border_paint,
         })
     }
 
@@ -69,48 +97,27 @@ impl CoverRenderer {
         let destination = Rect::from_xywh(left, top, side, side);
         let radius = side * 0.055;
 
-        if let Some(filter) = &self.shadow_filter {
-            let mut shadow_paint = Paint::default();
-            shadow_paint
-                .set_anti_alias(true)
-                .set_color(Color::from_argb(120, 0, 0, 0))
-                .set_mask_filter(filter.clone());
+        if self.shadow_filter.is_some() {
             let shadow_rect = Rect::from_xywh(left, top + side * 0.025, side, side);
             canvas.draw_rrect(
                 RRect::new_rect_xy(shadow_rect, radius, radius),
-                &shadow_paint,
+                &self.shadow_paint,
             );
         }
 
-        let image_width = self.image.width() as f32;
-        let image_height = self.image.height() as f32;
-        let crop_side = image_width.min(image_height);
-        let source = Rect::from_xywh(
-            (image_width - crop_side) * 0.5,
-            (image_height - crop_side) * 0.5,
-            crop_side,
-            crop_side,
-        );
         let rounded = RRect::new_rect_xy(destination, radius, radius);
         let saved = canvas.save();
         canvas.clip_rrect(rounded, None, true);
-        let mut image_paint = Paint::default();
-        image_paint.set_anti_alias(true);
         canvas.draw_image_rect(
             &self.image,
-            Some((&source, SrcRectConstraint::Strict)),
+            Some((&self.source, SrcRectConstraint::Strict)),
             &destination,
-            &image_paint,
+            &self.image_paint,
         );
         canvas.restore_to_count(saved);
 
-        let mut border_paint = Paint::default();
-        border_paint
-            .set_anti_alias(true)
-            .set_style(PaintStyle::Stroke)
-            .set_stroke_width((side * 0.002).max(1.0))
-            .set_color(Color::from_argb(38, 255, 255, 255));
-        canvas.draw_rrect(rounded, &border_paint);
+        self.border_paint.set_stroke_width((side * 0.002).max(1.0));
+        canvas.draw_rrect(rounded, &self.border_paint);
 
         if let Some(paragraph) = &self.title_paragraph {
             paragraph.paint(canvas, Point::new(left, top + side + title_gap));
@@ -162,10 +169,10 @@ impl CoverRenderer {
         if self.shadow_filter.is_some() && (self.shadow_sigma - sigma).abs() < 0.01 {
             return Ok(());
         }
-        self.shadow_filter = Some(
-            MaskFilter::blur(BlurStyle::Normal, sigma, true)
-                .context("create cover shadow filter")?,
-        );
+        let filter = MaskFilter::blur(BlurStyle::Normal, sigma, true)
+            .context("create cover shadow filter")?;
+        self.shadow_paint.set_mask_filter(Some(filter.clone()));
+        self.shadow_filter = Some(filter);
         self.shadow_sigma = sigma;
         Ok(())
     }

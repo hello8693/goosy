@@ -95,6 +95,30 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
             .as_bool()
             .ok_or_else(|| "request.no_audio must be boolean".to_owned())?;
     }
+    if let Some(value) = object.get("render_translation") {
+        options.render_translation = value
+            .as_bool()
+            .ok_or_else(|| "request.render_translation must be boolean".to_owned())?;
+    }
+    if let Some(value) = object.get("render_background_vocal") {
+        options.render_background_vocal = value
+            .as_bool()
+            .ok_or_else(|| "request.render_background_vocal must be boolean".to_owned())?;
+    }
+    if let Some(value) = object.get("excluded_lines") {
+        let values = value
+            .as_array()
+            .ok_or_else(|| "request.excluded_lines must be an array".to_owned())?;
+        options.excluded_lines = values
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .map(|index| index as usize)
+                    .ok_or_else(|| "request.excluded_lines must contain integers".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
     options.format = match object
         .get("format")
         .and_then(serde_json::Value::as_str)

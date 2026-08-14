@@ -25,8 +25,8 @@ pub struct BackgroundRenderer {
 impl BackgroundRenderer {
     pub fn dynamic() -> Self {
         let mut renderer = Self { layers: Vec::new() };
-        renderer.add_layer(GradientLayer);
-        renderer.add_layer(FallbackMaskLayer);
+        renderer.add_layer(GradientLayer::new());
+        renderer.add_layer(FallbackMaskLayer::new());
         renderer
     }
 
@@ -43,6 +43,12 @@ impl BackgroundRenderer {
     pub fn from_image_bytes(bytes: &[u8]) -> Result<Self> {
         let image =
             Image::from_encoded(Data::new_copy(bytes)).context("decode background image")?;
+        Self::from_image(image)
+    }
+
+    pub(crate) fn from_image(image: Image) -> Result<Self> {
+        let image_width = image.width() as f32;
+        let image_height = image.height() as f32;
         let sampled_color = sample_image_color(&image).unwrap_or((32, 32, 40));
         let blur_filter = image_filters::blur(
             (BACKGROUND_BLUR_SIGMA, BACKGROUND_BLUR_SIGMA),
@@ -54,10 +60,12 @@ impl BackgroundRenderer {
         let mut renderer = Self { layers: Vec::new() };
         renderer.add_layer(ImageLayer {
             image,
-            sampled_color,
-            blur_filter,
+            image_width,
+            image_height,
+            blur_paints: ImageLayer::make_blur_paints(&blur_filter),
+            tint_paint: ImageLayer::make_tint_paint(sampled_color),
         });
-        renderer.add_layer(FallbackMaskLayer);
+        renderer.add_layer(FallbackMaskLayer::new());
         Ok(renderer)
     }
 
@@ -76,47 +84,58 @@ impl BackgroundRenderer {
     }
 }
 
-struct GradientLayer;
+struct GradientLayer {
+    last_lift: Option<i32>,
+    last_frame: Option<(f32, f32, f32, f32)>,
+    paint: Paint,
+}
+
+impl GradientLayer {
+    fn new() -> Self {
+        Self {
+            last_lift: None,
+            last_frame: None,
+            paint: Paint::default(),
+        }
+    }
+}
 
 impl BackgroundLayer for GradientLayer {
     fn draw(&mut self, canvas: &Canvas, geometry: &FrameGeometry, t_ms: u64) -> Result<()> {
         let phase = (t_ms as f32 / 12_000.0).sin();
         let lift = (phase * 5.0) as i32;
-        let colors = [
-            Color::from_argb(255, 16, 16, 20).into(),
-            Color::from_argb(
-                255,
-                (28 + lift).clamp(0, 255) as u8,
-                28,
-                (38 + lift).clamp(0, 255) as u8,
-            )
-            .into(),
-        ];
-        let positions = [0.0, 1.0];
-        let gradient = Gradient::new(
-            Colors::new(&colors, Some(&positions), TileMode::Clamp, None),
-            skia_safe::gradient::Interpolation::default(),
-        );
-        let mut paint = Paint::default();
-        paint.set_shader(
-            linear_gradient(
-                (
-                    Point::new(0.0, geometry.frame.y),
-                    Point::new(0.0, geometry.frame.bottom()),
-                ),
-                &gradient,
-                None,
-            )
-            .context("create background shader")?,
-        );
+        let frame = geometry.frame;
+        let frame_key = (frame.x, frame.y, frame.width, frame.height);
+        if self.last_lift != Some(lift) || self.last_frame != Some(frame_key) {
+            let colors = [
+                Color::from_argb(255, 16, 16, 20).into(),
+                Color::from_argb(
+                    255,
+                    (28 + lift).clamp(0, 255) as u8,
+                    28,
+                    (38 + lift).clamp(0, 255) as u8,
+                )
+                .into(),
+            ];
+            let positions = [0.0, 1.0];
+            let gradient = Gradient::new(
+                Colors::new(&colors, Some(&positions), TileMode::Clamp, None),
+                skia_safe::gradient::Interpolation::default(),
+            );
+            self.paint.set_shader(Some(
+                linear_gradient(
+                    (Point::new(0.0, frame.y), Point::new(0.0, frame.bottom())),
+                    &gradient,
+                    None,
+                )
+                .context("create background shader")?,
+            ));
+            self.last_lift = Some(lift);
+            self.last_frame = Some(frame_key);
+        }
         canvas.draw_rect(
-            Rect::from_xywh(
-                geometry.frame.x,
-                geometry.frame.y,
-                geometry.frame.width,
-                geometry.frame.height,
-            ),
-            &paint,
+            Rect::from_xywh(frame.x, frame.y, frame.width, frame.height),
+            &self.paint,
         );
         Ok(())
     }
@@ -153,14 +172,39 @@ fn sample_image_color(image: &Image) -> Option<(u8, u8, u8)> {
 
 struct ImageLayer {
     image: Image,
-    sampled_color: (u8, u8, u8),
-    blur_filter: ImageFilter,
+    image_width: f32,
+    image_height: f32,
+    blur_paints: [Paint; 2],
+    tint_paint: Paint,
+}
+
+impl ImageLayer {
+    fn make_blur_paints(blur_filter: &ImageFilter) -> [Paint; 2] {
+        [0.80_f32, 0.20_f32].map(|alpha| {
+            let mut paint = Paint::default();
+            paint
+                .set_alpha_f(alpha)
+                .set_image_filter(blur_filter.clone());
+            paint
+        })
+    }
+
+    fn make_tint_paint(sampled_color: (u8, u8, u8)) -> Paint {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_argb(
+            36,
+            sampled_color.0,
+            sampled_color.1,
+            sampled_color.2,
+        ));
+        paint
+    }
 }
 
 impl BackgroundLayer for ImageLayer {
     fn draw(&mut self, canvas: &Canvas, geometry: &FrameGeometry, t_ms: u64) -> Result<()> {
-        let iw = self.image.width() as f32;
-        let ih = self.image.height() as f32;
+        let iw = self.image_width;
+        let ih = self.image_height;
         if iw <= 0.0 || ih <= 0.0 {
             return Ok(());
         }
@@ -186,40 +230,37 @@ impl BackgroundLayer for ImageLayer {
             (0.0, 1.0, 0.80),
             ((phase * 1.7).sin() * 4.0 - 2.0, 1.08, 0.20),
         ];
-        for (angle, pass_scale, alpha) in passes {
+        for (index, (angle, pass_scale, _alpha)) in passes.into_iter().enumerate() {
             let saved = canvas.save();
             canvas.rotate(angle, Some(center));
             canvas.scale((pass_scale, pass_scale));
-            let mut paint = Paint::default();
-            paint
-                .set_alpha_f(alpha)
-                .set_image_filter(self.blur_filter.clone());
             canvas.draw_image_rect(
                 &self.image,
                 Some((&src, SrcRectConstraint::Strict)),
                 &dst,
-                &paint,
+                &self.blur_paints[index],
             );
             canvas.restore_to_count(saved);
         }
-        let mut tint = Paint::default();
-        tint.set_color(Color::from_argb(
-            36,
-            self.sampled_color.0,
-            self.sampled_color.1,
-            self.sampled_color.2,
-        ));
-        canvas.draw_rect(dst, &tint);
+        canvas.draw_rect(dst, &self.tint_paint);
         Ok(())
     }
 }
 
-struct FallbackMaskLayer;
+struct FallbackMaskLayer {
+    paint: Paint,
+}
+
+impl FallbackMaskLayer {
+    fn new() -> Self {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_argb(72, 0, 0, 0));
+        Self { paint }
+    }
+}
 
 impl BackgroundLayer for FallbackMaskLayer {
     fn draw(&mut self, canvas: &Canvas, geometry: &FrameGeometry, _t_ms: u64) -> Result<()> {
-        let mut paint = Paint::default();
-        paint.set_color(Color::from_argb(72, 0, 0, 0));
         canvas.draw_rect(
             Rect::from_xywh(
                 geometry.frame.x,
@@ -227,7 +268,7 @@ impl BackgroundLayer for FallbackMaskLayer {
                 geometry.frame.width,
                 geometry.frame.height,
             ),
-            &paint,
+            &self.paint,
         );
         Ok(())
     }

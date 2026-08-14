@@ -37,20 +37,38 @@ impl Renderer {
     ) -> Result<Self> {
         Self::with_scene(width, height, fps, lines, background, None)
     }
-
-    pub fn with_scene(
+    pub fn with_scene_options(
         width: u32,
         height: u32,
         fps: u32,
-        lines: Vec<LyricLine>,
+        mut lines: Vec<LyricLine>,
         background: BackgroundRenderer,
         cover: Option<CoverRenderer>,
+        render_translation: bool,
+        render_background_vocal: bool,
+        excluded_lines: &[usize],
     ) -> Result<Self> {
         if width == 0 || height == 0 || fps == 0 {
             bail!("width, height, and fps must be positive");
         }
+        if !excluded_lines.is_empty() {
+            let excluded = excluded_lines
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            lines = lines
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, line)| (!excluded.contains(&index)).then_some(line))
+                .collect();
+        }
         let geometry = FrameGeometry::for_frame(width, height);
-        let lyrics = LyricsRenderer::new(&lines, geometry.lyrics)?;
+        let lyrics = LyricsRenderer::new_with_options(
+            &lines,
+            geometry.lyrics,
+            render_translation,
+            render_background_vocal,
+        )?;
         let layout = Layout::new(
             &lines,
             geometry.lyrics.height,
@@ -58,6 +76,7 @@ impl Renderer {
             lyrics.group_gap(),
             lyrics.interlude_slot_height(),
         );
+        let surface = crate::surface::SurfaceRenderer::try_new()?;
         Ok(Self {
             width,
             height,
@@ -68,7 +87,7 @@ impl Renderer {
             background,
             cover,
             lyrics,
-            surface: crate::surface::SurfaceRenderer::new(),
+            surface,
             info: ImageInfo::new(
                 ISize::new(width as i32, height as i32),
                 ColorType::RGBA8888,
@@ -79,6 +98,30 @@ impl Renderer {
         })
     }
 
+    pub fn with_scene(
+        width: u32,
+        height: u32,
+        fps: u32,
+        lines: Vec<LyricLine>,
+        background: BackgroundRenderer,
+        cover: Option<CoverRenderer>,
+    ) -> Result<Self> {
+        Self::with_scene_options(
+            width,
+            height,
+            fps,
+            lines,
+            background,
+            cover,
+            true,
+            true,
+            &[],
+        )
+    }
+
+    pub fn backend_details(&self) -> String {
+        self.surface.backend_details()
+    }
     pub fn backend_name(&self) -> &'static str {
         self.surface.backend_name()
     }
@@ -107,6 +150,29 @@ impl Renderer {
                 lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
             })
     }
+}
+
+#[cfg(target_os = "windows")]
+pub fn probe_renderer_initialization(width: u32, height: u32, fps: u32) -> Result<()> {
+    use crate::lrc::LyricLine;
+
+    skia_safe::icu::init();
+    let _font_manager = skia_safe::FontMgr::new();
+    let lines = vec![LyricLine {
+        start_ms: 0,
+        end_ms: 1_000,
+        text: "Goosy 渲染探针".to_owned(),
+        translation: Some("Renderer probe".to_owned()),
+        agent_id: None,
+        is_duet: false,
+        is_background: false,
+        background_vocal: None,
+        words: Vec::new(),
+    }];
+    let mut renderer = Renderer::new(width, height, fps, lines)?;
+    let mut pixels = Vec::new();
+    renderer.render_frame_into(0, &mut pixels)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -146,6 +212,48 @@ mod tests {
         let first = renderer.render_frame(1_000)?;
         let second = renderer.render_frame(1_000)?;
         assert_eq!(first, second);
+        Ok(())
+    }
+    #[test]
+    fn excluded_lines_are_removed_without_retiming_remaining_lines() -> Result<()> {
+        let lines = vec![
+            LyricLine {
+                start_ms: 0,
+                end_ms: 1_000,
+                text: "Excluded".to_owned(),
+                translation: None,
+                agent_id: None,
+                is_duet: false,
+                is_background: false,
+                background_vocal: None,
+                words: Vec::new(),
+            },
+            LyricLine {
+                start_ms: 1_000,
+                end_ms: 2_000,
+                text: "Visible".to_owned(),
+                translation: None,
+                agent_id: None,
+                is_duet: false,
+                is_background: false,
+                background_vocal: None,
+                words: Vec::new(),
+            },
+        ];
+        let renderer = Renderer::with_scene_options(
+            320,
+            180,
+            30,
+            lines,
+            BackgroundRenderer::dynamic(),
+            None,
+            true,
+            true,
+            &[0],
+        )?;
+        assert_eq!(renderer.lines.len(), 1);
+        assert_eq!(renderer.lines[0].text, "Visible");
+        assert_eq!(renderer.lines[0].start_ms, 1_000);
         Ok(())
     }
 }

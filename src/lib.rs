@@ -6,6 +6,7 @@ pub mod geometry;
 pub mod layout;
 pub mod lrc;
 pub mod lyrics_renderer;
+pub mod pdf_renderer;
 pub mod renderer;
 pub mod spring;
 pub mod surface;
@@ -13,9 +14,22 @@ pub mod ttml;
 pub mod video;
 pub mod yrc;
 
+// Prefer the discrete adapter on Windows hybrid-GPU systems. NVIDIA Optimus and
+// AMD PowerXpress inspect these exports before the GPU backend creates its device.
+#[cfg(target_os = "windows")]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static NvOptimusEnablement: u32 = 1;
+
+#[cfg(target_os = "windows")]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
 pub use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
+pub use pdf_renderer::{PdfOptions, render_lyrics_pdf};
 pub use renderer::Renderer;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +57,9 @@ pub struct RenderOptions {
     pub title: Option<String>,
     pub no_embedded_cover: bool,
     pub no_audio: bool,
+    pub render_translation: bool,
+    pub render_background_vocal: bool,
+    pub excluded_lines: Vec<usize>,
     pub format: LyricFormat,
 }
 
@@ -60,6 +77,9 @@ impl RenderOptions {
             title: None,
             no_embedded_cover: false,
             no_audio: false,
+            render_translation: true,
+            render_background_vocal: true,
+            excluded_lines: Vec::new(),
             format: LyricFormat::Auto,
         }
     }
@@ -125,15 +145,18 @@ where
     } else {
         None
     };
-    let mut renderer = Renderer::with_scene(
+    let mut renderer = Renderer::with_scene_options(
         options.width,
         options.height,
         options.fps,
         lines,
         background_layer,
         cover_layer,
+        options.render_translation,
+        options.render_background_vocal,
+        &options.excluded_lines,
     )?;
-    let mut writer = video::VideoWriter::new(
+    let mut writer = video::AsyncVideoWriter::new(
         &options.output,
         options.width,
         options.height,
@@ -147,7 +170,7 @@ where
     for frame in 0..total_frames {
         let t_ms = frame * 1_000 / options.fps as u64;
         renderer.render_frame_into(t_ms, &mut rgba)?;
-        writer.write_frame(&rgba)?;
+        writer.submit_frame(&mut rgba)?;
         progress.inc(1);
         on_progress(
             frame + 1,

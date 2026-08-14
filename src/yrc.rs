@@ -35,10 +35,12 @@ fn parse_words(text: &str) -> (String, Vec<LyricWord>) {
     let mut plain = String::new();
     let mut words = Vec::new();
     let mut cursor = 0;
-    while let Some((open, close, start_ms, duration_ms)) = next_word_tag(text, cursor) {
+    let mut next = next_word_tag(text, cursor);
+    while let Some((open, close, start_ms, duration_ms)) = next {
         plain.push_str(&text[cursor..open]);
         let content_start = close + 1;
-        let next_open = next_word_tag(text, content_start)
+        next = next_word_tag(text, content_start);
+        let next_open = next
             .map(|(next_open, _, _, _)| next_open)
             .unwrap_or(text.len());
         let word_text = &text[content_start..next_open];

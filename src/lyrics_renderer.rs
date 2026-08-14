@@ -5,7 +5,8 @@ use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, RectHeightStyle, RectWidthStyle,
     TextAlign, TextBox, TextStyle,
 };
-use skia_safe::{Canvas, Color, FontMgr, FontStyle, ImageFilter, Paint, PathBuilder, Point, Rect};
+use skia_safe::{Canvas, Color, FontMgr, FontStyle, Paint, PathBuilder, Point, Rect};
+use std::cell::RefCell;
 
 use crate::easing::bez_in;
 use crate::geometry::Viewport;
@@ -26,6 +27,8 @@ pub struct LyricsRenderer {
     background_solid_paragraphs: Vec<Option<Paragraph>>,
     background_word_boxes: Vec<Vec<Vec<TextBox>>>,
     background_translation_paragraphs: Vec<Option<Paragraph>>,
+    base_heights: Vec<f32>,
+    translation_heights: Vec<f32>,
     margin_x: f32,
     text_width: f32,
     main_font_size: f32,
@@ -35,11 +38,21 @@ pub struct LyricsRenderer {
     dot_size: f32,
     dot_gap: f32,
     dot_margin: f32,
-    lyric_blurs: Vec<Option<ImageFilter>>,
+    lyric_blur_paints: Vec<Option<RefCell<Paint>>>,
+    dot_paint: RefCell<Paint>,
 }
 
 impl LyricsRenderer {
     pub fn new(lines: &[LyricLine], viewport: Viewport) -> Result<Self> {
+        Self::new_with_options(lines, viewport, true, true)
+    }
+
+    pub fn new_with_options(
+        lines: &[LyricLine],
+        viewport: Viewport,
+        render_translation: bool,
+        render_background_vocal: bool,
+    ) -> Result<Self> {
         let margin_x = viewport.x;
         let text_width = viewport.width.max(1.0);
         let main_font_size = if viewport.width <= 768.0 {
@@ -60,28 +73,36 @@ impl LyricsRenderer {
         )?;
         let solid_paragraphs = build_paragraphs(lines, Color::WHITE, text_width, main_font_size)?;
         let word_boxes = build_word_geometry(lines, &base_paragraphs);
-        let translation_paragraphs = build_translation_paragraphs(
-            lines,
-            text_width,
-            translation_font_size,
-            main_font_size * 1.3,
-        )?;
-        let background_lines = lines
-            .iter()
-            .map(|line| {
-                line.background_vocal.as_ref().map(|background| LyricLine {
-                    start_ms: background.start_ms,
-                    end_ms: background.end_ms,
-                    text: background.text.clone(),
-                    translation: background.translation.clone(),
-                    agent_id: line.agent_id.clone(),
-                    is_duet: line.is_duet,
-                    is_background: true,
-                    background_vocal: None,
-                    words: background.words.clone(),
+        let translation_paragraphs = if render_translation {
+            build_translation_paragraphs(
+                lines,
+                text_width,
+                translation_font_size,
+                main_font_size * 1.3,
+            )?
+        } else {
+            (0..lines.len()).map(|_| None).collect()
+        };
+        let background_lines = if render_background_vocal {
+            lines
+                .iter()
+                .map(|line| {
+                    line.background_vocal.as_ref().map(|background| LyricLine {
+                        start_ms: background.start_ms,
+                        end_ms: background.end_ms,
+                        text: background.text.clone(),
+                        translation: background.translation.clone(),
+                        agent_id: line.agent_id.clone(),
+                        is_duet: line.is_duet,
+                        is_background: true,
+                        background_vocal: None,
+                        words: background.words.clone(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        } else {
+            (0..lines.len()).map(|_| None).collect()
+        };
         let background_paragraphs = build_optional_paragraphs(
             &background_lines,
             Color::from_argb(102, 255, 255, 255),
@@ -96,37 +117,48 @@ impl LyricsRenderer {
         )?;
         let background_word_boxes =
             build_optional_word_geometry(&background_lines, &background_paragraphs);
-        let background_translation_paragraphs = build_optional_translation_paragraphs(
-            &background_lines,
-            text_width,
-            background_translation_font_size,
-            background_font_size * 1.3,
-        )?;
+        let background_translation_paragraphs = if render_background_vocal && render_translation {
+            build_optional_translation_paragraphs(
+                &background_lines,
+                text_width,
+                background_translation_font_size,
+                background_font_size * 1.3,
+            )?
+        } else {
+            (0..lines.len()).map(|_| None).collect()
+        };
         let group_gap = main_font_size * GROUP_GAP_EM;
         let dot_size = (main_font_size * 0.5).max(6.0);
         let dot_gap = (main_font_size * 0.25).max(2.0);
         let dot_margin = main_font_size * 0.4;
+        let base_heights = base_paragraphs
+            .iter()
+            .map(Paragraph::height)
+            .collect::<Vec<_>>();
+        let translation_heights = translation_paragraphs
+            .iter()
+            .map(|paragraph| paragraph.as_ref().map(Paragraph::height).unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let background_heights = background_paragraphs
+            .iter()
+            .map(|paragraph| paragraph.as_ref().map(Paragraph::height).unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let background_translation_heights = background_translation_paragraphs
+            .iter()
+            .map(|paragraph| paragraph.as_ref().map(Paragraph::height).unwrap_or(0.0))
+            .collect::<Vec<_>>();
         let group_heights = lines
             .iter()
             .enumerate()
             .map(|(index, _line)| {
-                let translation_height = translation_paragraphs[index]
-                    .as_ref()
-                    .map(|paragraph| paragraph.height())
-                    .unwrap_or(0.0);
+                let translation_height = translation_heights[index];
                 let translation_gap = if translation_height > 0.0 {
                     main_font_size * TRANSLATION_GAP_EM
                 } else {
                     0.0
                 };
-                let background_height = background_paragraphs[index]
-                    .as_ref()
-                    .map(|paragraph| paragraph.height())
-                    .unwrap_or(0.0);
-                let background_translation_height = background_translation_paragraphs[index]
-                    .as_ref()
-                    .map(|paragraph| paragraph.height())
-                    .unwrap_or(0.0);
+                let background_height = background_heights[index];
+                let background_translation_height = background_translation_heights[index];
                 let background_gap = if background_height > 0.0 {
                     main_font_size * BACKGROUND_GAP_EM
                 } else {
@@ -137,7 +169,7 @@ impl LyricsRenderer {
                 } else {
                     0.0
                 };
-                (base_paragraphs[index].height()
+                (base_heights[index]
                     + translation_height
                     + translation_gap
                     + background_gap
@@ -146,13 +178,16 @@ impl LyricsRenderer {
                     + background_translation_height) as f64
             })
             .collect();
-        let mut lyric_blurs = vec![None];
+        let mut lyric_blur_paints = vec![None];
         for sigma in 1..=5 {
-            lyric_blurs.push(Some(
-                image_filters::blur((sigma as f32, sigma as f32), None, None, None)
-                    .context("create lyric blur filter")?,
-            ));
+            let filter = image_filters::blur((sigma as f32, sigma as f32), None, None, None)
+                .context("create lyric blur filter")?;
+            let mut paint = Paint::default();
+            paint.set_image_filter(filter);
+            lyric_blur_paints.push(Some(RefCell::new(paint)));
         }
+        let mut dot_paint = Paint::default();
+        dot_paint.set_color(Color::WHITE);
         Ok(Self {
             base_paragraphs,
             solid_paragraphs,
@@ -163,6 +198,8 @@ impl LyricsRenderer {
             background_solid_paragraphs,
             background_word_boxes,
             background_translation_paragraphs,
+            base_heights,
+            translation_heights,
             margin_x,
             text_width,
             main_font_size,
@@ -172,7 +209,8 @@ impl LyricsRenderer {
             dot_size,
             dot_gap,
             dot_margin,
-            lyric_blurs,
+            lyric_blur_paints,
+            dot_paint: RefCell::new(dot_paint),
         })
     }
 
@@ -195,11 +233,8 @@ impl LyricsRenderer {
                 continue;
             }
             let top_y = layout.pos_y[index].current_position() as f32;
-            let translation_height = self.translation_paragraphs[index]
-                .as_ref()
-                .map(|paragraph| paragraph.height())
-                .unwrap_or(0.0);
-            let extent = paragraph.height() + translation_height + self.main_font_size * 0.5;
+            let translation_height = self.translation_heights[index];
+            let extent = self.base_heights[index] + translation_height + self.main_font_size * 0.5;
             if top_y + extent < -self.main_font_size || top_y > height as f32 + self.main_font_size
             {
                 continue;
@@ -225,14 +260,12 @@ impl LyricsRenderer {
             canvas.translate((-anchor_x, -top_y));
             let blur_sigma = ((index as isize - active_idx as isize).abs() as f32).min(5.0);
             if blur_sigma > 0.01 {
-                let blur_filter = self.lyric_blurs[blur_sigma as usize]
+                let mut layer_paint = self.lyric_blur_paints[blur_sigma as usize]
                     .as_ref()
-                    .expect("cached lyric blur filter");
-                let mut layer_paint = Paint::default();
-                layer_paint
-                    .set_alpha_f(opacity)
-                    .set_image_filter(blur_filter.clone());
-                let layer_rec = SaveLayerRec::default().paint(&layer_paint);
+                    .expect("cached lyric blur paint")
+                    .borrow_mut();
+                layer_paint.set_alpha_f(opacity);
+                let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
                 let layer = canvas.save_layer(&layer_rec);
                 draw_line(
                     canvas,
@@ -297,7 +330,7 @@ impl LyricsRenderer {
                     0.0
                 };
                 let background_top = top_y
-                    + paragraph.height()
+                    + self.base_heights[index]
                     + translation_height
                     + translation_gap
                     + self.main_font_size * BACKGROUND_GAP_EM;
@@ -385,8 +418,7 @@ impl LyricsRenderer {
         canvas.translate((center.x, center.y));
         canvas.scale((scale as f32 * 0.7, scale as f32 * 0.7));
         canvas.translate((-center.x, -center.y));
-        let mut paint = Paint::default();
-        paint.set_color(Color::WHITE);
+        let mut paint = self.dot_paint.borrow_mut();
         for (index, opacity) in dot_opacity.into_iter().enumerate() {
             paint.set_alpha_f(opacity as f32);
             canvas.draw_circle(

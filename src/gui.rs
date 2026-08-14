@@ -1,4 +1,5 @@
 use eframe::egui;
+use libgoosy::{LyricFormat, lrc, video};
 use rfd::FileDialog;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -33,6 +34,11 @@ const LYRIC_EXTENSIONS: &[&str] = &["lrc", "ttml", "xml", "yrc"];
 const COVER_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff", "avif", "heic", "heif",
 ];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppPage {
+    Render,
+    Lyrics,
+}
 
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -66,11 +72,22 @@ struct GoosyApp {
     no_audio: bool,
     render_child: Option<Child>,
     progress_receiver: Option<mpsc::Receiver<String>>,
+    log_receiver: Option<mpsc::Receiver<String>>,
     progress: f32,
     speed_history: VecDeque<(f32, f32)>,
     current_speed: f32,
     last_progress_sample: Option<(f32, f32)>,
+    render_stage: String,
+    render_log: String,
     status: String,
+    page: AppPage,
+    render_translation: bool,
+    render_background_vocal: bool,
+    speed_printer: bool,
+    auto_exclude_credits: bool,
+    lyric_lines: Vec<lrc::LyricLine>,
+    manual_excluded_lines: Vec<bool>,
+    auto_excluded_lines: Vec<bool>,
 }
 
 impl Default for GoosyApp {
@@ -90,11 +107,22 @@ impl Default for GoosyApp {
             no_audio: false,
             render_child: None,
             progress_receiver: None,
+            log_receiver: None,
             progress: 0.0,
             speed_history: VecDeque::new(),
             current_speed: 0.0,
             last_progress_sample: None,
+            render_stage: String::new(),
+            render_log: String::new(),
             status: String::new(),
+            page: AppPage::Render,
+            render_translation: true,
+            render_background_vocal: true,
+            speed_printer: false,
+            auto_exclude_credits: false,
+            lyric_lines: Vec::new(),
+            manual_excluded_lines: Vec::new(),
+            auto_excluded_lines: Vec::new(),
         }
     }
 }
@@ -111,7 +139,7 @@ impl GoosyApp {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(format!("{stem}.mp4"));
-        let metadata_title = crate::video::audio_metadata(&path)
+        let metadata_title = video::audio_metadata(&path)
             .ok()
             .and_then(|metadata| metadata.title);
         self.audio = Some(path);
@@ -125,6 +153,232 @@ impl GoosyApp {
             "已根据音频名称找到歌词和封面候选".to_owned()
         } else {
             "未找到同名歌词，将尝试读取音频内嵌歌词".to_owned()
+        };
+        self.reload_lyrics_preview();
+    }
+
+    fn reload_lyrics_preview(&mut self) {
+        self.lyric_lines.clear();
+        self.manual_excluded_lines.clear();
+        self.auto_excluded_lines.clear();
+        let Some(audio) = self.audio.as_deref() else {
+            return;
+        };
+        let lyrics_path = self
+            .selected_lyrics
+            .and_then(|index| self.lyrics_candidates.get(index))
+            .cloned();
+        let text = match lyrics_path.as_deref() {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.status = format!("读取歌词失败：{error}");
+                    return;
+                }
+            },
+            None => match video::audio_metadata(audio)
+                .ok()
+                .and_then(|metadata| metadata.lyrics)
+            {
+                Some(text) => text,
+                None => {
+                    self.status = "当前音频没有可预览的内嵌歌词".to_owned();
+                    return;
+                }
+            },
+        };
+        match libgoosy::parse_lyrics(&text, LyricFormat::Auto) {
+            Ok(lines) => {
+                self.lyric_lines = lines;
+                self.manual_excluded_lines = vec![false; self.lyric_lines.len()];
+                self.recompute_auto_exclusions();
+            }
+            Err(error) => {
+                self.status = format!("解析歌词失败：{error}");
+            }
+        }
+    }
+
+    fn recompute_auto_exclusions(&mut self) {
+        self.auto_excluded_lines = if self.auto_exclude_credits {
+            detect_credit_lines(&self.lyric_lines)
+        } else {
+            vec![false; self.lyric_lines.len()]
+        };
+    }
+
+    fn excluded_line_indices(&self) -> Vec<usize> {
+        self.lyric_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                (self
+                    .manual_excluded_lines
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false)
+                    || self
+                        .auto_excluded_lines
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn format_line_time(time_ms: u64) -> String {
+        format!(
+            "{:02}:{:02}.{:03}",
+            time_ms / 60_000,
+            (time_ms / 1_000) % 60,
+            time_ms % 1_000
+        )
+    }
+
+    fn draw_lyrics_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("歌词行控制");
+        ui.label("取消勾选的行不会进入渲染布局，后续歌词的时间轴保持不变。");
+        ui.add_space(8.0);
+        let auto_changed = ui
+            .checkbox(
+                &mut self.auto_exclude_credits,
+                "自动排除头部/尾部的歌手、作曲、作词等署名信息",
+            )
+            .changed();
+        if auto_changed {
+            self.recompute_auto_exclusions();
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.render_translation, "渲染翻译");
+            ui.checkbox(&mut self.render_background_vocal, "渲染伴唱");
+        });
+        ui.checkbox(&mut self.speed_printer, "速印机优化（黑白双色）");
+        ui.add_space(6.0);
+        if ui
+            .add_enabled(
+                !self.lyric_lines.is_empty() && self.render_child.is_none(),
+                egui::Button::new("导出可打印 PDF…"),
+            )
+            .clicked()
+        {
+            self.export_pdf();
+        }
+        if !self.status.is_empty() {
+            ui.label(&self.status);
+        }
+        ui.separator();
+        if self.lyric_lines.is_empty() {
+            ui.label("选择音频或歌词文件后，这里会显示可单独排除的歌词行。");
+            return;
+        }
+        let excluded_count = self.excluded_line_indices().len();
+        ui.label(format!(
+            "共 {} 行，当前排除 {} 行",
+            self.lyric_lines.len(),
+            excluded_count
+        ));
+        egui::ScrollArea::vertical()
+            .id_salt("lyric_line_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for index in 0..self.lyric_lines.len() {
+                    let line = &self.lyric_lines[index];
+                    let auto_excluded = self.auto_excluded_lines[index];
+                    let mut excluded = self.manual_excluded_lines[index] || auto_excluded;
+                    let label = format!(
+                        "{}  {}",
+                        Self::format_line_time(line.start_ms),
+                        if line.text.trim().is_empty() {
+                            "（空行）"
+                        } else {
+                            line.text.trim()
+                        }
+                    );
+                    let changed = ui
+                        .add_enabled(!auto_excluded, egui::Checkbox::new(&mut excluded, label))
+                        .changed();
+                    if changed {
+                        self.manual_excluded_lines[index] = excluded;
+                    }
+                    if auto_excluded {
+                        ui.label("自动识别的署名行");
+                    }
+                }
+            });
+    }
+
+    fn export_pdf(&mut self) {
+        if self.lyric_lines.is_empty() {
+            self.status = "请先选择有效的歌词文件".to_owned();
+            return;
+        }
+        let default_name = self
+            .audio
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("lyrics");
+        let Some(mut output) = FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(format!("{default_name}.pdf"))
+            .save_file()
+        else {
+            return;
+        };
+        if output.extension().is_none() {
+            output.set_extension("pdf");
+        }
+        let Some(audio) = self.audio.as_ref() else {
+            self.status = "请先选择音频".to_owned();
+            return;
+        };
+        let Ok(mut executable) = std::env::current_exe() else {
+            self.status = "无法定位 goosy 可执行文件".to_owned();
+            return;
+        };
+        executable.set_file_name(if cfg!(windows) {
+            "goosy-render-worker.exe"
+        } else {
+            "goosy-render-worker"
+        });
+        if !executable.is_file() {
+            self.status = format!("找不到独立渲染进程：{}", executable.display());
+            return;
+        }
+        let lyrics = self
+            .selected_lyrics
+            .and_then(|index| self.lyrics_candidates.get(index));
+        let mut command = Command::new(executable);
+        command.arg("pdf").arg(audio);
+        if let Some(lyrics) = lyrics {
+            command.arg(lyrics);
+        }
+        command.arg("--output").arg(&output);
+        if !self.title.trim().is_empty() {
+            command.arg("--title").arg(self.title.trim());
+        }
+        if !self.render_translation {
+            command.arg("--no-translation");
+        }
+        if !self.render_background_vocal {
+            command.arg("--no-background-vocal");
+        }
+        if self.speed_printer {
+            command.arg("--speed-printer");
+        }
+        for index in self.excluded_line_indices() {
+            command.arg("--exclude-line").arg(index.to_string());
+        }
+        self.status = match command.output() {
+            Ok(result) if result.status.success() => {
+                format!("PDF 导出完成：{}", output.display())
+            }
+            Ok(result) => format!(
+                "PDF 导出失败：{}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            ),
+            Err(error) => format!("PDF 导出失败：{error}"),
         };
     }
 
@@ -142,7 +396,7 @@ impl GoosyApp {
 
     fn choose_lyrics(&mut self) {
         let Some(path) = FileDialog::new()
-            .add_filter("Lyrics", &["lrc", "ttml", "xml", "yrc"])
+            .add_filter("Lyrics", LYRIC_EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -154,6 +408,7 @@ impl GoosyApp {
             .lyrics_candidates
             .iter()
             .position(|candidate| candidate == &path);
+        self.reload_lyrics_preview();
     }
 
     fn choose_cover(&mut self) {
@@ -186,10 +441,21 @@ impl GoosyApp {
         let lyrics = self
             .selected_lyrics
             .and_then(|index| self.lyrics_candidates.get(index).cloned());
-        let Ok(executable) = std::env::current_exe() else {
-            self.status = "无法定位 goosy 可执行文件".to_owned();
+        let Ok(mut executable) = std::env::current_exe() else {
+            let message = "无法定位 goosy 可执行文件".to_owned();
+            self.status = message;
             return;
         };
+        executable.set_file_name(if cfg!(windows) {
+            "goosy-render-worker.exe"
+        } else {
+            "goosy-render-worker"
+        });
+        if !executable.is_file() {
+            let message = format!("找不到独立渲染进程：{}", executable.display());
+            self.status = message;
+            return;
+        }
         let mut command = Command::new(executable);
         command.arg("render").arg(audio);
         if let Some(lyrics) = lyrics {
@@ -208,9 +474,18 @@ impl GoosyApp {
             .arg("auto")
             .arg("--progress-events")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if self.no_audio {
             command.arg("--no-audio");
+        }
+        if !self.render_translation {
+            command.arg("--no-translation");
+        }
+        if !self.render_background_vocal {
+            command.arg("--no-background-vocal");
+        }
+        for index in self.excluded_line_indices() {
+            command.arg("--exclude-line").arg(index.to_string());
         }
         if !self.use_embedded_cover {
             command.arg("--no-embedded-cover");
@@ -225,82 +500,130 @@ impl GoosyApp {
         }
         match command.spawn() {
             Ok(mut child) => {
-                let receiver = child.stdout.take().map(|stdout| {
-                    let (sender, receiver) = mpsc::channel();
+                let (progress_sender, progress_receiver) = mpsc::channel();
+                let (log_sender, log_receiver) = mpsc::channel();
+                if let Some(stdout) = child.stdout.take() {
                     thread::spawn(move || {
-                        for line in BufReader::new(stdout).lines().filter_map(Result::ok) {
-                            let _ = sender.send(line);
+                        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                            let _ = progress_sender.send(line);
                         }
                     });
-                    receiver
-                });
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    thread::spawn(move || {
+                        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                            let _ = log_sender.send(line);
+                        }
+                    });
+                }
                 self.render_child = Some(child);
-                self.progress_receiver = receiver;
+                self.progress_receiver = Some(progress_receiver);
+                self.log_receiver = Some(log_receiver);
                 self.progress = 0.0;
                 self.speed_history.clear();
                 self.current_speed = 0.0;
                 self.last_progress_sample = None;
+                self.render_stage = "启动渲染进程".to_owned();
+                self.render_log.clear();
+                self.status = "渲染进程已启动，等待首帧…".to_owned();
             }
             Err(error) => {
-                self.status = format!("启动渲染失败：{error}");
+                let message = format!("启动渲染失败：{error}");
+                self.status = message;
             }
         }
     }
+
     fn poll_render(&mut self, context: &egui::Context) {
         if let Some(receiver) = &self.progress_receiver {
-            for line in receiver.try_iter() {
+            let lines: Vec<_> = receiver.try_iter().collect();
+            for line in lines {
                 let mut fields = line.split_whitespace();
-                if fields.next() == Some("GOOSY_PROGRESS") {
-                    let done = fields.next().and_then(|value| value.parse::<f32>().ok());
-                    let total = fields.next().and_then(|value| value.parse::<f32>().ok());
-                    let elapsed = fields.next().and_then(|value| value.parse::<f32>().ok());
-                    if let (Some(done), Some(total), Some(elapsed)) = (done, total, elapsed) {
-                        self.progress = if total > 0.0 {
-                            (done / total).clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                        if elapsed > 0.0 {
-                            self.current_speed = if let Some((previous_done, previous_elapsed)) =
-                                self.last_progress_sample
-                            {
-                                let frame_delta = done - previous_done;
-                                let time_delta = (elapsed - previous_elapsed).max(0.001);
-                                frame_delta / time_delta
-                            } else {
-                                done / elapsed
-                            };
-                            self.last_progress_sample = Some((done, elapsed));
-                            self.speed_history.push_back((elapsed, self.current_speed));
-                            while self.speed_history.len() > 120 {
-                                self.speed_history.pop_front();
-                            }
+                match fields.next() {
+                    Some("GOOSY_STAGE") => {
+                        let _key = fields.next();
+                        let message = fields.collect::<Vec<_>>().join(" ");
+                        if !message.is_empty() {
+                            self.render_stage = message.clone();
+                            self.status = message;
                         }
-                        self.status = format!(
-                            "正在渲染：{done:.0}/{total:.0} · {:.1} 帧/秒",
-                            self.current_speed
-                        );
+                    }
+                    Some("GOOSY_PROGRESS") => {
+                        let done = fields.next().and_then(|value| value.parse::<f32>().ok());
+                        let total = fields.next().and_then(|value| value.parse::<f32>().ok());
+                        let elapsed = fields.next().and_then(|value| value.parse::<f32>().ok());
+                        if let (Some(done), Some(total), Some(elapsed)) = (done, total, elapsed) {
+                            self.progress = if total > 0.0 {
+                                (done / total).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            if elapsed > 0.0 {
+                                self.current_speed =
+                                    if let Some((previous_done, previous_elapsed)) =
+                                        self.last_progress_sample
+                                    {
+                                        (done - previous_done)
+                                            / (elapsed - previous_elapsed).max(0.001)
+                                    } else {
+                                        done / elapsed
+                                    };
+                                self.last_progress_sample = Some((done, elapsed));
+                                self.speed_history.push_back((elapsed, self.current_speed));
+                                while self.speed_history.len() > 120 {
+                                    self.speed_history.pop_front();
+                                }
+                            }
+                            self.status = format!(
+                                "正在渲染：{done:.0}/{total:.0} · {:.1} 帧/秒",
+                                self.current_speed
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(receiver) = &self.log_receiver {
+            let lines: Vec<_> = receiver.try_iter().collect();
+            for line in lines {
+                if !line.trim().is_empty() {
+                    // The stderr reader thread already persisted this line synchronously.
+                    if !self.render_log.is_empty() {
+                        self.render_log.push('\n');
+                    }
+                    self.render_log.push_str(&line);
+                    if self.render_log.len() > 8_192 {
+                        let keep_from = self.render_log.len() - 8_192;
+                        let boundary = self.render_log.ceil_char_boundary(keep_from);
+                        self.render_log.drain(..boundary);
                     }
                 }
             }
+        }
+        if !self.render_log.is_empty() {
+            self.status = format!("{}：\n{}", self.render_stage, self.render_log);
         }
         let result = self.render_child.as_mut().map(|child| child.try_wait());
         match result {
             Some(Ok(Some(status))) => {
                 self.render_child = None;
                 self.progress_receiver = None;
+                self.log_receiver = None;
                 self.progress = if status.success() { 1.0 } else { self.progress };
-                self.status = if status.success() {
-                    "渲染完成".to_owned()
-                } else {
-                    format!("渲染失败：{status}")
-                };
+                if status.success() {
+                    self.status = "渲染完成".to_owned();
+                } else if self.render_log.is_empty() {
+                    self.status = format!("渲染失败：{status}");
+                }
             }
             Some(Ok(None)) => context.request_repaint_after(Duration::from_millis(100)),
             Some(Err(error)) => {
                 self.render_child = None;
                 self.progress_receiver = None;
-                self.status = format!("读取渲染状态失败：{error}");
+                self.log_receiver = None;
+                let message = format!("读取渲染状态失败：{error}");
+                self.status = message;
             }
             None => {}
         }
@@ -368,169 +691,196 @@ impl eframe::App for GoosyApp {
         self.poll_render(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("GoosyRenderer");
-            ui.label("选择音频后，自动匹配同名歌词与封面。");
-            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(self.page == AppPage::Render, "渲染设置")
+                    .clicked()
+                {
+                    self.page = AppPage::Render;
+                }
+                if ui
+                    .selectable_label(self.page == AppPage::Lyrics, "歌词行控制")
+                    .clicked()
+                {
+                    self.page = AppPage::Lyrics;
+                }
+            });
+            ui.separator();
+            if self.page == AppPage::Render {
+                ui.label("选择音频后，自动匹配同名歌词与封面。");
+                ui.add_space(8.0);
 
-            egui::Grid::new("source_grid")
-                .num_columns(2)
-                .spacing([12.0, 12.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("音频");
-                    ui.horizontal(|ui| {
-                        let name = self
-                            .audio
-                            .as_ref()
-                            .and_then(|path| path.file_name())
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("尚未选择");
-                        ui.label(name);
-                        if ui.button("选择音频…").clicked() {
-                            self.choose_audio();
+                egui::Grid::new("source_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 12.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("音频");
+                        ui.horizontal(|ui| {
+                            let name = self
+                                .audio
+                                .as_ref()
+                                .and_then(|path| path.file_name())
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("尚未选择");
+                            ui.label(name);
+                            if ui.button("选择音频…").clicked() {
+                                self.choose_audio();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("歌词");
+                        let previous_lyrics = self.selected_lyrics;
+                        ui.horizontal(|ui| {
+                            if self.lyrics_candidates.is_empty() {
+                                ui.label("未找到同名歌词，将读取音频内嵌歌词");
+                            } else {
+                                let selected = Self::selected_name(
+                                    &self.lyrics_candidates,
+                                    self.selected_lyrics,
+                                    "选择歌词",
+                                );
+                                egui::ComboBox::from_id_salt("lyrics_combo")
+                                    .selected_text(selected)
+                                    .show_ui(ui, |ui| {
+                                        for (index, path) in
+                                            self.lyrics_candidates.iter().enumerate()
+                                        {
+                                            let name = path
+                                                .file_name()
+                                                .and_then(|name| name.to_str())
+                                                .unwrap_or("lyrics");
+                                            ui.selectable_value(
+                                                &mut self.selected_lyrics,
+                                                Some(index),
+                                                name,
+                                            );
+                                        }
+                                    });
+                            }
+                            if ui.button("手动选择…").clicked() {
+                                self.choose_lyrics();
+                            }
+                        });
+                        ui.end_row();
+                        if previous_lyrics != self.selected_lyrics {
+                            self.reload_lyrics_preview();
                         }
-                    });
-                    ui.end_row();
 
-                    ui.label("歌词");
-                    ui.horizontal(|ui| {
-                        if self.lyrics_candidates.is_empty() {
-                            ui.label("未找到同名歌词，将读取音频内嵌歌词");
-                        } else {
+                        ui.label("封面");
+                        ui.horizontal(|ui| {
                             let selected = Self::selected_name(
-                                &self.lyrics_candidates,
-                                self.selected_lyrics,
-                                "选择歌词",
+                                &self.cover_candidates,
+                                self.selected_cover,
+                                "不显示封面",
                             );
-                            egui::ComboBox::from_id_salt("lyrics_combo")
-                                .selected_text(selected)
-                                .show_ui(ui, |ui| {
-                                    for (index, path) in self.lyrics_candidates.iter().enumerate() {
-                                        let name = path
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or("lyrics");
-                                        ui.selectable_value(
-                                            &mut self.selected_lyrics,
-                                            Some(index),
-                                            name,
-                                        );
-                                    }
-                                });
-                        }
-                        if ui.button("手动选择…").clicked() {
-                            self.choose_lyrics();
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("封面");
-                    ui.horizontal(|ui| {
-                        let selected = Self::selected_name(
-                            &self.cover_candidates,
-                            self.selected_cover,
-                            "不显示封面",
-                        );
-                        if !self.cover_candidates.is_empty() {
-                            egui::ComboBox::from_id_salt("cover_combo")
-                                .selected_text(selected)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.selected_cover,
-                                        None,
-                                        "不显示封面",
-                                    );
-                                    for (index, path) in self.cover_candidates.iter().enumerate() {
-                                        let name = path
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or("cover");
+                            if !self.cover_candidates.is_empty() {
+                                egui::ComboBox::from_id_salt("cover_combo")
+                                    .selected_text(selected)
+                                    .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut self.selected_cover,
-                                            Some(index),
-                                            name,
+                                            None,
+                                            "不显示封面",
                                         );
-                                    }
-                                });
-                        } else {
-                            ui.label(if self.use_embedded_cover {
-                                "将使用音频内嵌封面"
+                                        for (index, path) in
+                                            self.cover_candidates.iter().enumerate()
+                                        {
+                                            let name = path
+                                                .file_name()
+                                                .and_then(|name| name.to_str())
+                                                .unwrap_or("cover");
+                                            ui.selectable_value(
+                                                &mut self.selected_cover,
+                                                Some(index),
+                                                name,
+                                            );
+                                        }
+                                    });
                             } else {
-                                "未找到同名封面"
-                            });
-                        }
-                        if ui.button("手动选择…").clicked() {
-                            self.choose_cover();
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("歌曲名称");
-                    ui.text_edit_singleline(&mut self.title);
-                    ui.end_row();
-
-                    ui.label("输出文件");
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            self.output
-                                .as_ref()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "选择音频后自动生成".to_owned()),
-                        );
-                        if ui.button("选择输出…").clicked() {
-                            if let Some(path) =
-                                FileDialog::new().set_file_name("lyrics.mp4").save_file()
-                            {
-                                self.output = Some(path);
+                                ui.label(if self.use_embedded_cover {
+                                    "将使用音频内嵌封面"
+                                } else {
+                                    "未找到同名封面"
+                                });
                             }
-                        }
+                            if ui.button("手动选择…").clicked() {
+                                self.choose_cover();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("歌曲名称");
+                        ui.text_edit_singleline(&mut self.title);
+                        ui.end_row();
+
+                        ui.label("输出文件");
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                self.output
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| "选择音频后自动生成".to_owned()),
+                            );
+                            if ui.button("选择输出…").clicked() {
+                                if let Some(path) =
+                                    FileDialog::new().set_file_name("lyrics.mp4").save_file()
+                                {
+                                    self.output = Some(path);
+                                }
+                            }
+                        });
+                        ui.end_row();
                     });
-                    ui.end_row();
+
+                ui.separator();
+                ui.collapsing("输出设置", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("尺寸");
+                        ui.add(
+                            egui::DragValue::new(&mut self.width)
+                                .range(320..=7680)
+                                .suffix(" px"),
+                        );
+                        ui.label("×");
+                        ui.add(
+                            egui::DragValue::new(&mut self.height)
+                                .range(180..=4320)
+                                .suffix(" px"),
+                        );
+                        ui.label("帧率");
+                        ui.add(
+                            egui::DragValue::new(&mut self.fps)
+                                .range(1..=120)
+                                .suffix(" fps"),
+                        );
+                    });
+                    ui.checkbox(&mut self.use_embedded_cover, "默认使用音频内嵌封面");
+                    ui.checkbox(&mut self.no_audio, "不输出音频");
                 });
 
-            ui.separator();
-            ui.collapsing("输出设置", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("尺寸");
-                    ui.add(
-                        egui::DragValue::new(&mut self.width)
-                            .range(320..=7680)
-                            .suffix(" px"),
-                    );
-                    ui.label("×");
-                    ui.add(
-                        egui::DragValue::new(&mut self.height)
-                            .range(180..=4320)
-                            .suffix(" px"),
-                    );
-                    ui.label("帧率");
-                    ui.add(
-                        egui::DragValue::new(&mut self.fps)
-                            .range(1..=120)
-                            .suffix(" fps"),
-                    );
-                });
-                ui.checkbox(&mut self.use_embedded_cover, "默认使用音频内嵌封面");
-                ui.checkbox(&mut self.no_audio, "不输出音频");
-            });
-
-            ui.add_space(12.0);
-            let running = self.render_child.is_some();
-            if ui
-                .add_enabled(!running, egui::Button::new("开始渲染"))
-                .clicked()
-            {
-                self.start_render();
-            }
-            if running {
-                ui.spinner();
-                ui.add(egui::ProgressBar::new(self.progress).show_percentage());
-            }
-            if !self.speed_history.is_empty() {
-                self.draw_speed_graph(ui);
-            }
-            if !self.status.is_empty() {
-                ui.add_space(8.0);
-                ui.label(&self.status);
+                ui.add_space(12.0);
+                let running = self.render_child.is_some();
+                if ui
+                    .add_enabled(!running, egui::Button::new("开始渲染"))
+                    .clicked()
+                {
+                    self.start_render();
+                }
+                if running {
+                    ui.spinner();
+                    ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+                }
+                if !self.speed_history.is_empty() {
+                    self.draw_speed_graph(ui);
+                }
+                if !self.status.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(&self.status);
+                }
+            } else {
+                self.draw_lyrics_page(ui);
             }
         });
     }
@@ -580,9 +930,51 @@ fn has_extension(extension: &str, accepted: &[&str]) -> bool {
         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
 }
 
+const CREDIT_MARKERS: &[&str] = &[
+    "歌手", "作曲", "作词", "作詞", "演唱", "编曲", "制作", "原唱", "词：", "曲：", "词:", "曲:",
+    "artist", "singer", "composer", "lyricist", "arranger", "producer",
+];
+
+fn detect_credit_lines(lines: &[lrc::LyricLine]) -> Vec<bool> {
+    let mut excluded = vec![false; lines.len()];
+    if lines.is_empty() {
+        return excluded;
+    }
+    let edge_count = ((lines.len() + 9) / 10).clamp(2, 8).min(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        let in_edge = index < edge_count || index >= lines.len() - edge_count;
+        let main = line.text.to_lowercase();
+        let translation = line
+            .translation
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        excluded[index] = in_edge
+            && CREDIT_MARKERS
+                .iter()
+                .any(|marker| main.contains(marker) || translation.contains(marker));
+    }
+    excluded
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{COVER_EXTENSIONS, LYRIC_EXTENSIONS, has_extension};
+    use super::{COVER_EXTENSIONS, LYRIC_EXTENSIONS, detect_credit_lines, has_extension};
+    use libgoosy::lrc::LyricLine;
+
+    fn line(text: &str) -> LyricLine {
+        LyricLine {
+            start_ms: 0,
+            end_ms: 1_000,
+            text: text.to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }
+    }
 
     #[test]
     fn accepts_case_insensitive_sibling_extensions() {
@@ -590,5 +982,22 @@ mod tests {
         assert!(has_extension("JPEG", COVER_EXTENSIONS));
         assert!(has_extension("webp", COVER_EXTENSIONS));
         assert!(!has_extension("mp3", COVER_EXTENSIONS));
+    }
+
+    #[test]
+    fn detects_credit_markers_only_at_edges() {
+        let lines = vec![
+            line("歌手：Someone"),
+            line("普通歌词"),
+            line("作词：Someone"),
+        ];
+        assert_eq!(detect_credit_lines(&lines), vec![true, false, true]);
+    }
+
+    #[test]
+    fn does_not_exclude_credit_word_in_middle_of_song() {
+        let mut lines = vec![line("普通歌词"); 10];
+        lines[5] = line("作曲的旋律");
+        assert!(!detect_credit_lines(&lines)[5]);
     }
 }
