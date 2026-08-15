@@ -1,7 +1,9 @@
 mod gui;
 
 #[cfg(not(target_os = "windows"))]
-use libgoosy::{background, cover_renderer, lrc, pdf_renderer, renderer, ttml, video, yrc};
+use libgoosy::{
+    LyricsStyle, background, cover_renderer, lrc, pdf_renderer, renderer, ttml, video, yrc,
+};
 
 use anyhow::Result;
 #[cfg(not(target_os = "windows"))]
@@ -72,6 +74,18 @@ enum Command {
         height: u32,
         #[arg(long, default_value_t = 30)]
         fps: u32,
+        #[arg(long, default_value_t = 1.0)]
+        font_scale: f32,
+        #[arg(long, default_value_t = 1.0)]
+        line_height_scale: f32,
+        #[arg(long, default_value_t = 1.0)]
+        line_spacing_scale: f32,
+        #[arg(long, default_value_t = 1.0)]
+        translation_gap_scale: f32,
+        #[arg(long, default_value_t = 1.0)]
+        background_gap_scale: f32,
+        #[arg(long, default_value_t = 1.0)]
+        horizontal_padding_scale: f32,
         #[arg(long)]
         background: Option<PathBuf>,
         #[arg(long)]
@@ -152,6 +166,12 @@ fn main() -> Result<()> {
             width,
             height,
             fps,
+            font_scale,
+            line_height_scale,
+            line_spacing_scale,
+            translation_gap_scale,
+            background_gap_scale,
+            horizontal_padding_scale,
             background,
             cover,
             title,
@@ -169,6 +189,12 @@ fn main() -> Result<()> {
             width,
             height,
             fps,
+            font_scale,
+            line_height_scale,
+            line_spacing_scale,
+            translation_gap_scale,
+            background_gap_scale,
+            horizontal_padding_scale,
             background,
             cover,
             title,
@@ -230,6 +256,12 @@ fn render(
     width: u32,
     height: u32,
     fps: u32,
+    font_scale: f32,
+    line_height_scale: f32,
+    line_spacing_scale: f32,
+    translation_gap_scale: f32,
+    background_gap_scale: f32,
+    horizontal_padding_scale: f32,
     background: Option<PathBuf>,
     cover: Option<PathBuf>,
     title: Option<String>,
@@ -311,6 +343,14 @@ fn render(
         cover_layer,
         !no_translation,
         !no_background_vocal,
+        LyricsStyle {
+            font_scale,
+            line_height_scale,
+            group_gap_scale: line_spacing_scale,
+            translation_gap_scale,
+            background_gap_scale,
+            horizontal_padding_scale,
+        },
         &exclude_lines,
     )
     .context("初始化图形渲染器")?;

@@ -6,7 +6,7 @@ use crate::cover_renderer::CoverRenderer;
 use crate::geometry::FrameGeometry;
 use crate::layout::Layout;
 use crate::lrc::LyricLine;
-use crate::lyrics_renderer::LyricsRenderer;
+use crate::lyrics_renderer::{LyricsRenderer, LyricsStyle};
 
 pub struct Renderer {
     pub width: u32,
@@ -46,6 +46,7 @@ impl Renderer {
         cover: Option<CoverRenderer>,
         render_translation: bool,
         render_background_vocal: bool,
+        lyrics_style: LyricsStyle,
         excluded_lines: &[usize],
     ) -> Result<Self> {
         if width == 0 || height == 0 || fps == 0 {
@@ -68,6 +69,7 @@ impl Renderer {
             geometry.lyrics,
             render_translation,
             render_background_vocal,
+            lyrics_style,
         )?;
         let layout = Layout::new(
             &lines,
@@ -115,6 +117,7 @@ impl Renderer {
             cover,
             true,
             true,
+            LyricsStyle::default(),
             &[],
         )
     }
@@ -249,6 +252,7 @@ mod tests {
             None,
             true,
             true,
+            LyricsStyle::default(),
             &[0],
         )?;
         assert_eq!(renderer.lines.len(), 1);

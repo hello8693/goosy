@@ -27,6 +27,12 @@ pub struct RenderOptions {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<u32>,
+    pub font_scale: Option<f64>,
+    pub line_height_scale: Option<f64>,
+    pub line_spacing_scale: Option<f64>,
+    pub translation_gap_scale: Option<f64>,
+    pub background_gap_scale: Option<f64>,
+    pub horizontal_padding_scale: Option<f64>,
     pub background: Option<String>,
     pub cover: Option<String>,
     pub title: Option<String>,
@@ -102,6 +108,13 @@ pub fn render(options: RenderOptions) -> Result<()> {
     rust.width = options.width.unwrap_or(1920);
     rust.height = options.height.unwrap_or(1080);
     rust.fps = options.fps.unwrap_or(30);
+    rust.lyrics_style.font_scale = options.font_scale.unwrap_or(1.0) as f32;
+    rust.lyrics_style.line_height_scale = options.line_height_scale.unwrap_or(1.0) as f32;
+    rust.lyrics_style.group_gap_scale = options.line_spacing_scale.unwrap_or(1.0) as f32;
+    rust.lyrics_style.translation_gap_scale = options.translation_gap_scale.unwrap_or(1.0) as f32;
+    rust.lyrics_style.background_gap_scale = options.background_gap_scale.unwrap_or(1.0) as f32;
+    rust.lyrics_style.horizontal_padding_scale =
+        options.horizontal_padding_scale.unwrap_or(1.0) as f32;
     rust.background = options.background.map(PathBuf::from);
     rust.cover = options.cover.map(PathBuf::from);
     rust.title = options.title;

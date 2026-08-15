@@ -141,6 +141,10 @@ impl Layout {
         self.active_idx
     }
 
+    pub fn focus_idx(&self) -> usize {
+        self.focus_idx
+    }
+
     fn group_height(&self, index: usize) -> f64 {
         self.group_heights.get(index).copied().unwrap_or(0.0)
     }

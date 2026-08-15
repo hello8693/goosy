@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use skia_safe::canvas::SaveLayerRec;
 use skia_safe::image_filters;
 use skia_safe::textlayout::{
@@ -17,6 +17,53 @@ const BACKGROUND_GAP_EM: f32 = 0.12;
 const BACKGROUND_FONT_SCALE: f32 = 0.7;
 const GROUP_GAP_EM: f32 = 0.45;
 const HIGHLIGHT_FADE_MS: f32 = 140.0;
+const HORIZONTAL_PADDING_RATIO: f32 = 0.05;
+const MIN_HORIZONTAL_PADDING: f32 = 16.0;
+const INTERLUDE_DOT_BASE_SCALE: f32 = 0.7;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LyricsStyle {
+    pub font_scale: f32,
+    pub line_height_scale: f32,
+    pub group_gap_scale: f32,
+    pub translation_gap_scale: f32,
+    pub background_gap_scale: f32,
+    pub horizontal_padding_scale: f32,
+}
+
+impl Default for LyricsStyle {
+    fn default() -> Self {
+        Self {
+            font_scale: 1.0,
+            line_height_scale: 1.0,
+            group_gap_scale: 1.0,
+            translation_gap_scale: 1.0,
+            background_gap_scale: 1.0,
+            horizontal_padding_scale: 1.0,
+        }
+    }
+}
+
+impl LyricsStyle {
+    fn validate(self) -> Result<()> {
+        let valid = self.font_scale.is_finite()
+            && (0.5..=2.0).contains(&self.font_scale)
+            && self.line_height_scale.is_finite()
+            && (0.8..=1.8).contains(&self.line_height_scale)
+            && [
+                self.group_gap_scale,
+                self.translation_gap_scale,
+                self.background_gap_scale,
+                self.horizontal_padding_scale,
+            ]
+            .into_iter()
+            .all(|scale| scale.is_finite() && (0.0..=2.0).contains(&scale));
+        if !valid {
+            bail!("invalid lyrics style scale");
+        }
+        Ok(())
+    }
+}
 pub struct LyricsRenderer {
     base_paragraphs: Vec<Paragraph>,
     solid_paragraphs: Vec<Paragraph>,
@@ -40,11 +87,12 @@ pub struct LyricsRenderer {
     dot_margin: f32,
     lyric_blur_paints: Vec<Option<RefCell<Paint>>>,
     dot_paint: RefCell<Paint>,
+    style: LyricsStyle,
 }
 
 impl LyricsRenderer {
     pub fn new(lines: &[LyricLine], viewport: Viewport) -> Result<Self> {
-        Self::new_with_options(lines, viewport, true, true)
+        Self::new_with_options(lines, viewport, true, true, LyricsStyle::default())
     }
 
     pub fn new_with_options(
@@ -52,16 +100,22 @@ impl LyricsRenderer {
         viewport: Viewport,
         render_translation: bool,
         render_background_vocal: bool,
+        style: LyricsStyle,
     ) -> Result<Self> {
-        let margin_x = viewport.x;
-        let text_width = viewport.width.max(1.0);
-        let main_font_size = if viewport.width <= 768.0 {
+        style.validate()?;
+        let horizontal_padding = ((viewport.width * HORIZONTAL_PADDING_RATIO)
+            .max(MIN_HORIZONTAL_PADDING)
+            * style.horizontal_padding_scale)
+            .min(viewport.width * 0.2);
+        let margin_x = viewport.x + horizontal_padding;
+        let text_width = (viewport.width - horizontal_padding * 2.0).max(1.0);
+        let main_font_size = (if viewport.width <= 768.0 {
             (viewport.width * 0.08).max(12.0)
         } else {
             (viewport.height * 0.05)
                 .max(viewport.width * 0.025)
                 .max(12.0)
-        };
+        }) * style.font_scale;
         let translation_font_size = (main_font_size * 0.5).max(10.0);
         let background_font_size = (main_font_size * BACKGROUND_FONT_SCALE).max(10.0);
         let background_translation_font_size = (background_font_size * 0.5).max(10.0);
@@ -70,15 +124,22 @@ impl LyricsRenderer {
             Color::from_argb(102, 255, 255, 255),
             text_width,
             main_font_size,
+            style.line_height_scale,
         )?;
-        let solid_paragraphs = build_paragraphs(lines, Color::WHITE, text_width, main_font_size)?;
+        let solid_paragraphs = build_paragraphs(
+            lines,
+            Color::WHITE,
+            text_width,
+            main_font_size,
+            style.line_height_scale,
+        )?;
         let word_boxes = build_word_geometry(lines, &base_paragraphs);
         let translation_paragraphs = if render_translation {
             build_translation_paragraphs(
                 lines,
                 text_width,
                 translation_font_size,
-                main_font_size * 1.3,
+                main_font_size * 1.3 * style.line_height_scale,
             )?
         } else {
             (0..lines.len()).map(|_| None).collect()
@@ -108,12 +169,14 @@ impl LyricsRenderer {
             Color::from_argb(102, 255, 255, 255),
             text_width,
             background_font_size,
+            style.line_height_scale,
         )?;
         let background_solid_paragraphs = build_optional_paragraphs(
             &background_lines,
             Color::WHITE,
             text_width,
             background_font_size,
+            style.line_height_scale,
         )?;
         let background_word_boxes =
             build_optional_word_geometry(&background_lines, &background_paragraphs);
@@ -122,12 +185,12 @@ impl LyricsRenderer {
                 &background_lines,
                 text_width,
                 background_translation_font_size,
-                background_font_size * 1.3,
+                background_font_size * 1.3 * style.line_height_scale,
             )?
         } else {
             (0..lines.len()).map(|_| None).collect()
         };
-        let group_gap = main_font_size * GROUP_GAP_EM;
+        let group_gap = main_font_size * GROUP_GAP_EM * style.group_gap_scale;
         let dot_size = (main_font_size * 0.5).max(6.0);
         let dot_gap = (main_font_size * 0.25).max(2.0);
         let dot_margin = main_font_size * 0.4;
@@ -153,19 +216,19 @@ impl LyricsRenderer {
             .map(|(index, _line)| {
                 let translation_height = translation_heights[index];
                 let translation_gap = if translation_height > 0.0 {
-                    main_font_size * TRANSLATION_GAP_EM
+                    main_font_size * TRANSLATION_GAP_EM * style.translation_gap_scale
                 } else {
                     0.0
                 };
                 let background_height = background_heights[index];
                 let background_translation_height = background_translation_heights[index];
                 let background_gap = if background_height > 0.0 {
-                    main_font_size * BACKGROUND_GAP_EM
+                    main_font_size * BACKGROUND_GAP_EM * style.background_gap_scale
                 } else {
                     0.0
                 };
                 let background_translation_gap = if background_translation_height > 0.0 {
-                    background_font_size * TRANSLATION_GAP_EM
+                    background_font_size * TRANSLATION_GAP_EM * style.translation_gap_scale
                 } else {
                     0.0
                 };
@@ -210,6 +273,7 @@ impl LyricsRenderer {
             dot_gap,
             dot_margin,
             lyric_blur_paints,
+            style,
             dot_paint: RefCell::new(dot_paint),
         })
     }
@@ -225,7 +289,8 @@ impl LyricsRenderer {
         self.draw_interlude_dots(canvas, lines, layout, t_ms);
 
         let active_idx = layout.active_idx();
-        for (index, paragraph) in self.base_paragraphs.iter().enumerate() {
+        let focus_idx = layout.focus_idx();
+        for index in 0..self.base_paragraphs.len() {
             if lines[index].text.is_empty()
                 && self.translation_paragraphs[index].is_none()
                 && self.background_paragraphs[index].is_none()
@@ -240,7 +305,8 @@ impl LyricsRenderer {
                 continue;
             }
             let scale = layout.scale[index].current_position() as f32;
-            let opacity = edge_opacity(top_y, height as f32, index == active_idx);
+            let is_active = index == active_idx;
+            let opacity = edge_opacity(top_y, height as f32, is_active);
             let activation = ((t_ms.saturating_sub(lines[index].start_ms) as f32)
                 / HIGHLIGHT_FADE_MS)
                 .clamp(0.0, 1.0);
@@ -258,7 +324,7 @@ impl LyricsRenderer {
             canvas.translate((anchor_x, top_y));
             canvas.scale((scale, scale));
             canvas.translate((-anchor_x, -top_y));
-            let blur_sigma = ((index as isize - active_idx as isize).abs() as f32).min(5.0);
+            let blur_sigma = ((index as isize - focus_idx as isize).abs() as f32).min(5.0);
             if blur_sigma > 0.01 {
                 let mut layer_paint = self.lyric_blur_paints[blur_sigma as usize]
                     .as_ref()
@@ -267,95 +333,155 @@ impl LyricsRenderer {
                 layer_paint.set_alpha_f(opacity);
                 let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
                 let layer = canvas.save_layer(&layer_rec);
-                draw_line(
+                self.draw_group(
                     canvas,
-                    paragraph,
-                    &self.solid_paragraphs[index],
-                    &self.word_boxes[index],
-                    self.translation_paragraphs[index].as_ref(),
-                    &lines[index],
-                    index == active_idx,
+                    lines,
+                    index,
+                    is_active,
+                    true,
                     highlight_strength,
                     t_ms,
-                    self.margin_x,
-                    self.text_width,
                     top_y,
-                    self.main_font_size,
                 );
                 canvas.restore_to_count(layer);
-            } else {
-                if opacity >= 0.999 {
-                    draw_line(
-                        canvas,
-                        paragraph,
-                        &self.solid_paragraphs[index],
-                        &self.word_boxes[index],
-                        self.translation_paragraphs[index].as_ref(),
-                        &lines[index],
-                        true,
-                        highlight_strength,
-                        t_ms,
-                        self.margin_x,
-                        self.text_width,
-                        top_y,
-                        self.main_font_size,
-                    );
-                } else {
-                    let layer = canvas.save_layer_alpha_f(None, opacity);
-                    draw_line(
-                        canvas,
-                        paragraph,
-                        &self.solid_paragraphs[index],
-                        &self.word_boxes[index],
-                        self.translation_paragraphs[index].as_ref(),
-                        &lines[index],
-                        true,
-                        highlight_strength,
-                        t_ms,
-                        self.margin_x,
-                        self.text_width,
-                        top_y,
-                        self.main_font_size,
-                    );
-                    canvas.restore_to_count(layer);
-                }
-            }
-            if let (Some(background), Some(background_solid)) = (
-                self.background_paragraphs[index].as_ref(),
-                self.background_solid_paragraphs[index].as_ref(),
-            ) {
-                let translation_gap = if translation_height > 0.0 {
-                    self.main_font_size * TRANSLATION_GAP_EM
-                } else {
-                    0.0
-                };
-                let background_top = top_y
-                    + self.base_heights[index]
-                    + translation_height
-                    + translation_gap
-                    + self.main_font_size * BACKGROUND_GAP_EM;
-                let background_line = self.background_lines[index]
-                    .as_ref()
-                    .expect("background line initialized");
-                draw_line(
+            } else if opacity >= 0.999 {
+                self.draw_group(
                     canvas,
-                    background,
-                    background_solid,
-                    &self.background_word_boxes[index],
-                    self.background_translation_paragraphs[index].as_ref(),
-                    background_line,
-                    index == active_idx,
+                    lines,
+                    index,
+                    is_active,
+                    false,
                     highlight_strength,
                     t_ms,
-                    self.margin_x,
-                    self.text_width,
-                    background_top,
-                    self.background_font_size,
+                    top_y,
                 );
+            } else {
+                let layer = canvas.save_layer_alpha_f(None, opacity);
+                self.draw_group(
+                    canvas,
+                    lines,
+                    index,
+                    is_active,
+                    false,
+                    highlight_strength,
+                    t_ms,
+                    top_y,
+                );
+                canvas.restore_to_count(layer);
             }
             canvas.restore_to_count(transform);
         }
         Ok(())
+    }
+
+    fn draw_group(
+        &self,
+        canvas: &Canvas,
+        lines: &[LyricLine],
+        index: usize,
+        active: bool,
+        group_blurred: bool,
+        highlight_strength: f32,
+        t_ms: u64,
+        top_y: f32,
+    ) {
+        let paragraph = &self.base_paragraphs[index];
+        draw_line(
+            canvas,
+            paragraph,
+            &self.solid_paragraphs[index],
+            &self.word_boxes[index],
+            self.translation_paragraphs[index].as_ref(),
+            &lines[index],
+            active,
+            highlight_strength,
+            t_ms,
+            self.margin_x,
+            self.text_width,
+            top_y,
+            self.main_font_size,
+            self.style.translation_gap_scale,
+        );
+        let Some(background_line) = self.background_lines[index].as_ref() else {
+            return;
+        };
+        let translation_height = self.translation_heights[index];
+        let translation_gap = if translation_height > 0.0 {
+            self.main_font_size * TRANSLATION_GAP_EM * self.style.translation_gap_scale
+        } else {
+            0.0
+        };
+        let background_top = top_y
+            + self.base_heights[index]
+            + translation_height
+            + translation_gap
+            + self.main_font_size * BACKGROUND_GAP_EM * self.style.background_gap_scale;
+        let background_active = background_line.start_ms <= t_ms && t_ms < background_line.end_ms;
+        let background_highlight = if background_active {
+            highlight_strength
+        } else {
+            0.0
+        };
+        if !background_active && !group_blurred {
+            let layer_paint = self.lyric_blur_paints[1]
+                .as_ref()
+                .expect("cached background vocal blur paint")
+                .borrow();
+            let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
+            let layer = canvas.save_layer(&layer_rec);
+            self.draw_background_line(
+                canvas,
+                index,
+                background_line,
+                false,
+                0.0,
+                t_ms,
+                background_top,
+            );
+            canvas.restore_to_count(layer);
+        } else {
+            self.draw_background_line(
+                canvas,
+                index,
+                background_line,
+                background_active,
+                background_highlight,
+                t_ms,
+                background_top,
+            );
+        }
+    }
+
+    fn draw_background_line(
+        &self,
+        canvas: &Canvas,
+        index: usize,
+        line: &LyricLine,
+        active: bool,
+        highlight_strength: f32,
+        t_ms: u64,
+        top_y: f32,
+    ) {
+        draw_line(
+            canvas,
+            self.background_paragraphs[index]
+                .as_ref()
+                .expect("background paragraph initialized"),
+            self.background_solid_paragraphs[index]
+                .as_ref()
+                .expect("background solid paragraph initialized"),
+            &self.background_word_boxes[index],
+            self.background_translation_paragraphs[index].as_ref(),
+            line,
+            active,
+            highlight_strength,
+            t_ms,
+            self.margin_x,
+            self.text_width,
+            top_y,
+            self.background_font_size,
+            self.style.translation_gap_scale,
+        );
     }
     fn draw_interlude_dots(
         &self,
@@ -405,18 +531,17 @@ impl LyricsRenderer {
             return;
         };
         let width = self.dot_size * 3.0 + self.dot_gap * 2.0;
-        let left = if line.is_duet {
-            self.margin_x + self.text_width - width
-        } else {
-            self.margin_x
-        };
         let center = Point::new(
-            left + width / 2.0,
+            interlude_dot_center_x(self.margin_x, self.text_width, width, line.is_duet),
             slot_top + self.dot_margin + self.dot_size / 2.0,
         );
+        let left = center.x - width / 2.0;
         let transform = canvas.save();
         canvas.translate((center.x, center.y));
-        canvas.scale((scale as f32 * 0.7, scale as f32 * 0.7));
+        canvas.scale((
+            scale as f32 * INTERLUDE_DOT_BASE_SCALE,
+            scale as f32 * INTERLUDE_DOT_BASE_SCALE,
+        ));
         canvas.translate((-center.x, -center.y));
         let mut paint = self.dot_paint.borrow_mut();
         for (index, opacity) in dot_opacity.into_iter().enumerate() {
@@ -443,6 +568,15 @@ impl LyricsRenderer {
 
     pub fn group_gap(&self) -> f64 {
         self.group_gap
+    }
+}
+
+fn interlude_dot_center_x(margin_x: f32, text_width: f32, dot_width: f32, is_duet: bool) -> f32 {
+    let half_base_width = dot_width * INTERLUDE_DOT_BASE_SCALE / 2.0;
+    if is_duet {
+        margin_x + text_width - half_base_width
+    } else {
+        margin_x + half_base_width
     }
 }
 fn ease_in_out_back(x: f64) -> f64 {
@@ -476,6 +610,7 @@ fn draw_line(
     text_width: f32,
     top_y: f32,
     main_font_size: f32,
+    translation_gap_scale: f32,
 ) {
     let position = Point::new(margin_x, top_y);
     if !active {
@@ -484,7 +619,9 @@ fn draw_line(
             canvas,
             translation,
             margin_x,
-            top_y + paragraph.height() + main_font_size * TRANSLATION_GAP_EM,
+            top_y
+                + paragraph.height()
+                + main_font_size * TRANSLATION_GAP_EM * translation_gap_scale,
         );
         return;
     }
@@ -494,7 +631,9 @@ fn draw_line(
             canvas,
             translation,
             margin_x,
-            top_y + paragraph.height() + main_font_size * TRANSLATION_GAP_EM,
+            top_y
+                + paragraph.height()
+                + main_font_size * TRANSLATION_GAP_EM * translation_gap_scale,
         );
         return;
     }
@@ -617,7 +756,7 @@ fn draw_line(
         canvas,
         translation,
         margin_x,
-        top_y + paragraph.height() + main_font_size * TRANSLATION_GAP_EM,
+        top_y + paragraph.height() + main_font_size * TRANSLATION_GAP_EM * translation_gap_scale,
     );
 }
 
@@ -738,6 +877,7 @@ fn build_optional_paragraphs(
     color: Color,
     text_width: f32,
     font_size: f32,
+    line_height_scale: f32,
 ) -> Result<Vec<Option<Paragraph>>> {
     let mut collection = FontCollection::new();
     collection.set_default_font_manager(FontMgr::new(), None);
@@ -763,7 +903,7 @@ fn build_optional_paragraphs(
             text_style.set_font_size(font_size);
             text_style.set_color(color);
             text_style.set_font_style(FontStyle::bold());
-            text_style.set_height(1.3);
+            text_style.set_height(1.3 * line_height_scale);
             text_style.set_height_override(true);
             paragraph_style.set_text_style(&text_style);
             let mut builder = ParagraphBuilder::new(&paragraph_style, collection.clone());
@@ -825,6 +965,7 @@ fn build_paragraphs(
     color: Color,
     text_width: f32,
     font_size: f32,
+    line_height_scale: f32,
 ) -> Result<Vec<Paragraph>> {
     let mut collection = FontCollection::new();
     collection.set_default_font_manager(FontMgr::new(), None);
@@ -847,7 +988,7 @@ fn build_paragraphs(
             text_style.set_font_size(font_size);
             text_style.set_color(color);
             text_style.set_font_style(FontStyle::bold());
-            text_style.set_height(1.3);
+            text_style.set_height(1.3 * line_height_scale);
             text_style.set_height_override(true);
             paragraph_style.set_text_style(&text_style);
             let mut builder = ParagraphBuilder::new(&paragraph_style, collection.clone());
@@ -963,5 +1104,264 @@ mod tests {
             + translation_height
             + renderer.main_font_size * (TRANSLATION_GAP_EM + GROUP_GAP_EM);
         assert!((renderer.group_heights()[0] + renderer.group_gap()) as f32 >= required - 0.01);
+    }
+
+    fn line_with_background_vocal(
+        start_ms: u64,
+        end_ms: u64,
+        background_start_ms: u64,
+        background_end_ms: u64,
+    ) -> LyricLine {
+        use crate::lrc::{BackgroundVocal, LyricWord};
+
+        LyricLine {
+            start_ms,
+            end_ms,
+            text: String::new(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: Some(BackgroundVocal {
+                start_ms: background_start_ms,
+                end_ms: background_end_ms,
+                text: "Background vocal".to_owned(),
+                translation: None,
+                words: vec![LyricWord {
+                    start_ms: background_start_ms,
+                    end_ms: background_end_ms,
+                    text: "Background vocal".to_owned(),
+                }],
+            }),
+            words: Vec::new(),
+        }
+    }
+
+    fn blank_line(start_ms: u64, end_ms: u64) -> LyricLine {
+        LyricLine {
+            start_ms,
+            end_ms,
+            text: String::new(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }
+    }
+
+    fn rendered_alpha_pixel_count(lines: &[LyricLine], t_ms: u64, index: usize) -> usize {
+        use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
+
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let renderer = LyricsRenderer::new(lines, viewport).unwrap();
+        let mut layout = Layout::new(
+            lines,
+            viewport.height,
+            renderer.group_heights(),
+            renderer.group_gap(),
+            renderer.interlude_slot_height(),
+        );
+        layout.update(lines, t_ms, 30);
+        layout.pos_y[index].set_position(100.0);
+        layout.scale[index].set_position(1.0);
+
+        let dimensions = (viewport.width as i32, viewport.height as i32);
+        let mut surface = surfaces::raster_n32_premul(dimensions).unwrap();
+        surface.canvas().clear(Color::TRANSPARENT);
+        renderer
+            .draw(surface.canvas(), lines, &layout, t_ms, dimensions.1 as u32)
+            .unwrap();
+        let info = ImageInfo::new(dimensions, ColorType::RGBA8888, AlphaType::Premul, None);
+        let row_bytes = dimensions.0 as usize * 4;
+        let mut pixels = vec![0; info.compute_byte_size(row_bytes)];
+        assert!(surface.read_pixels(&info, &mut pixels, row_bytes, IPoint::new(0, 0),));
+        pixels.chunks_exact(4).filter(|pixel| pixel[3] != 0).count()
+    }
+
+    #[test]
+    fn background_vocal_is_blurred_outside_its_own_timing() {
+        let lines = vec![
+            line_with_background_vocal(0, 2_000, 800, 1_400),
+            blank_line(2_000, 4_000),
+        ];
+
+        let sharp_pixel_count = rendered_alpha_pixel_count(&lines, 1_000, 0);
+        let blurred_pixel_count = rendered_alpha_pixel_count(&lines, 500, 0);
+        assert!(
+            blurred_pixel_count > sharp_pixel_count,
+            "inactive background vocal should gain a blur halo even while its parent line is \
+             focused: blurred={blurred_pixel_count}, sharp={sharp_pixel_count}"
+        );
+    }
+
+    #[test]
+    fn sounding_background_vocal_blurs_when_its_group_starts_scrolling() {
+        let lines = vec![
+            line_with_background_vocal(0, 2_000, 0, 2_000),
+            blank_line(2_000, 4_000),
+        ];
+
+        let sharp_pixel_count = rendered_alpha_pixel_count(&lines, 1_000, 0);
+        let scrolling_pixel_count = rendered_alpha_pixel_count(&lines, 1_800, 0);
+        assert!(
+            scrolling_pixel_count > sharp_pixel_count,
+            "scrolling background vocal should gain the group blur halo: \
+             scrolling={scrolling_pixel_count}, sharp={sharp_pixel_count}"
+        );
+    }
+
+    #[test]
+    fn interlude_dots_align_at_rest_and_extend_past_the_text_edge_when_enlarged() {
+        let margin_x = 100.0;
+        let text_width = 500.0;
+        let dot_width = 90.0;
+        let left_center = interlude_dot_center_x(margin_x, text_width, dot_width, false);
+        let right_center = interlude_dot_center_x(margin_x, text_width, dot_width, true);
+        let resting_half_width = dot_width * INTERLUDE_DOT_BASE_SCALE / 2.0;
+
+        assert!((left_center - resting_half_width - margin_x).abs() < f32::EPSILON);
+        assert!(left_center - dot_width * 0.75 / 2.0 < margin_x);
+        assert!((right_center + resting_half_width - (margin_x + text_width)).abs() < f32::EPSILON);
+        assert!(right_center + dot_width * 0.75 / 2.0 > margin_x + text_width);
+    }
+
+    #[test]
+    fn lyric_content_has_padding_inside_the_golden_ratio_viewport() {
+        use crate::geometry::FrameGeometry;
+
+        let geometry = FrameGeometry::for_frame(1_920, 1_080);
+        let viewport = geometry.lyrics;
+        let lines = vec![LyricLine {
+            start_ms: 0,
+            end_ms: 2_000,
+            text: "Padded lyric".to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }];
+        let renderer = LyricsRenderer::new(&lines, viewport).unwrap();
+        let split_x = 1_920.0 * 0.381_966_011_25;
+
+        assert!((viewport.x - split_x).abs() < 0.01);
+        assert!(renderer.margin_x > viewport.x);
+        assert!(renderer.margin_x + renderer.text_width < viewport.x + viewport.width);
+        assert!(
+            ((renderer.margin_x - viewport.x)
+                - (viewport.x + viewport.width - renderer.margin_x - renderer.text_width))
+                .abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn font_scale_changes_lyric_size_and_reserved_group_height() {
+        let lines = vec![LyricLine {
+            start_ms: 0,
+            end_ms: 2_000,
+            text: "Scalable lyric text".to_owned(),
+            translation: Some("缩放歌词".to_owned()),
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }];
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let small = LyricsRenderer::new_with_options(
+            &lines,
+            viewport,
+            true,
+            true,
+            LyricsStyle {
+                font_scale: 0.75,
+                ..LyricsStyle::default()
+            },
+        )
+        .unwrap();
+        let large = LyricsRenderer::new_with_options(
+            &lines,
+            viewport,
+            true,
+            true,
+            LyricsStyle {
+                font_scale: 1.5,
+                ..LyricsStyle::default()
+            },
+        )
+        .unwrap();
+
+        assert!((large.main_font_size / small.main_font_size - 2.0).abs() < 0.001);
+        assert!(large.group_heights[0] > small.group_heights[0]);
+    }
+
+    #[test]
+    fn style_controls_line_height_spacing_gaps_and_padding_independently() {
+        use crate::lrc::{BackgroundVocal, LyricWord};
+
+        let lines = vec![LyricLine {
+            start_ms: 0,
+            end_ms: 2_000,
+            text: "A wrapped lyric line used to verify adjustable layout properties".to_owned(),
+            translation: Some("用于验证可调排版属性的翻译".to_owned()),
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: Some(BackgroundVocal {
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "Background vocal".to_owned(),
+                translation: None,
+                words: vec![LyricWord {
+                    start_ms: 0,
+                    end_ms: 2_000,
+                    text: "Background vocal".to_owned(),
+                }],
+            }),
+            words: Vec::new(),
+        }];
+        let viewport = Viewport {
+            x: 100.0,
+            y: 0.0,
+            width: 260.0,
+            height: 300.0,
+        };
+        let render =
+            |style| LyricsRenderer::new_with_options(&lines, viewport, true, true, style).unwrap();
+        let base = render(LyricsStyle::default());
+        let taller = render(LyricsStyle {
+            line_height_scale: 1.5,
+            ..LyricsStyle::default()
+        });
+        let wider_gaps = render(LyricsStyle {
+            group_gap_scale: 1.8,
+            translation_gap_scale: 2.0,
+            background_gap_scale: 2.0,
+            ..LyricsStyle::default()
+        });
+        let padded = render(LyricsStyle {
+            horizontal_padding_scale: 2.0,
+            ..LyricsStyle::default()
+        });
+
+        assert!(taller.base_heights[0] > base.base_heights[0]);
+        assert!(wider_gaps.group_gap > base.group_gap);
+        assert!(wider_gaps.group_heights[0] > base.group_heights[0]);
+        assert!(padded.margin_x > base.margin_x);
+        assert!(padded.text_width < base.text_width);
     }
 }

@@ -42,6 +42,16 @@ function renderCli(options) {
   for (const [key, defaultValue] of [['width', 1920], ['height', 1080], ['fps', 30]]) {
     args.push(`--${key}`, String(options[key] === undefined ? defaultValue : options[key]));
   }
+  args.push('--font-scale', String(options.font_scale === undefined ? 1 : options.font_scale));
+  for (const key of [
+    'line_height_scale',
+    'line_spacing_scale',
+    'translation_gap_scale',
+    'background_gap_scale',
+    'horizontal_padding_scale',
+  ]) {
+    args.push(`--${key.replaceAll('_', '-')}`, String(options[key] === undefined ? 1 : options[key]));
+  }
   args.push('--format', options.format || 'auto');
   if (options.background) args.push('--background', options.background);
   if (options.cover) args.push('--cover', options.cover);

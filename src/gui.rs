@@ -5,9 +5,30 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
+
+const DEFAULT_PREVIEW_INTERVAL: u64 = 15;
+static PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const RENDER_TWO_COLUMN_MIN_WIDTH: f32 = 760.0;
+
+fn render_page_uses_columns(available_width: f32) -> bool {
+    available_width >= RENDER_TWO_COLUMN_MIN_WIDTH
+}
+
+fn style_percent_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::Slider::new(value, range).suffix("%").show_value(true));
+    });
+}
 
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/fonts/NotoSansCJKsc-Regular.otf");
 
@@ -40,11 +61,49 @@ enum AppPage {
     Lyrics,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreviewEvent {
+    frame: u64,
+    width: usize,
+    height: usize,
+}
+
+fn parse_preview_event(line: &str) -> Option<PreviewEvent> {
+    let mut fields = line.split_whitespace();
+    (fields.next()? == "GOOSY_PREVIEW").then_some(())?;
+    let event = PreviewEvent {
+        frame: fields.next()?.parse().ok()?,
+        width: fields.next()?.parse().ok()?,
+        height: fields.next()?.parse().ok()?,
+    };
+    (event.width > 0 && event.height > 0 && fields.next().is_none()).then_some(event)
+}
+
+fn new_preview_directory() -> PathBuf {
+    let sequence = PREVIEW_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "goosy-render-preview-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+fn terminate_render_child(child: &mut Option<Child>) -> std::io::Result<bool> {
+    let Some(mut child) = child.take() else {
+        return Ok(false);
+    };
+    if child.try_wait()?.is_some() {
+        return Ok(false);
+    }
+    child.kill()?;
+    child.wait()?;
+    Ok(true)
+}
+
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 620.0])
-            .with_min_inner_size([680.0, 500.0]),
+            .with_inner_size([960.0, 620.0])
+            .with_min_inner_size([700.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -68,11 +127,21 @@ struct GoosyApp {
     width: u32,
     height: u32,
     fps: u32,
+    font_scale_percent: u32,
+    line_height_percent: u32,
+    line_spacing_percent: u32,
+    translation_gap_percent: u32,
+    background_gap_percent: u32,
+    horizontal_padding_percent: u32,
     use_embedded_cover: bool,
     no_audio: bool,
     render_child: Option<Child>,
     progress_receiver: Option<mpsc::Receiver<String>>,
     log_receiver: Option<mpsc::Receiver<String>>,
+    preview_interval: u64,
+    preview_directory: Option<PathBuf>,
+    preview_texture: Option<egui::TextureHandle>,
+    preview_frame: u64,
     progress: f32,
     speed_history: VecDeque<(f32, f32)>,
     current_speed: f32,
@@ -103,11 +172,21 @@ impl Default for GoosyApp {
             width: 1920,
             height: 1080,
             fps: 30,
+            font_scale_percent: 100,
+            line_height_percent: 100,
+            line_spacing_percent: 100,
+            translation_gap_percent: 100,
+            background_gap_percent: 100,
+            horizontal_padding_percent: 100,
             use_embedded_cover: true,
             no_audio: false,
             render_child: None,
             progress_receiver: None,
             log_receiver: None,
+            preview_interval: DEFAULT_PREVIEW_INTERVAL,
+            preview_directory: None,
+            preview_texture: None,
+            preview_frame: 0,
             progress: 0.0,
             speed_history: VecDeque::new(),
             current_speed: 0.0,
@@ -433,6 +512,72 @@ impl GoosyApp {
             .position(|candidate| candidate == &path);
     }
 
+    fn cleanup_preview_directory(&mut self) {
+        if let Some(directory) = self.preview_directory.take() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    fn preview_path(&self, frame: u64) -> Option<PathBuf> {
+        self.preview_directory
+            .as_ref()
+            .map(|directory| directory.join(format!("{frame}.rgba")))
+    }
+
+    fn discard_preview(&self, event: PreviewEvent) {
+        if let Some(path) = self.preview_path(event.frame) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn load_preview(&mut self, context: &egui::Context, event: PreviewEvent) {
+        let Some(path) = self.preview_path(event.frame) else {
+            return;
+        };
+        let expected_size = event.width.saturating_mul(event.height).saturating_mul(4);
+        let pixels = match std::fs::read(&path) {
+            Ok(pixels) if pixels.len() == expected_size => pixels,
+            Ok(pixels) => {
+                self.status = format!(
+                    "实时预览帧大小无效：应为 {expected_size} 字节，实际为 {} 字节",
+                    pixels.len()
+                );
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            Err(error) => {
+                self.status = format!("读取实时预览失败：{error}");
+                return;
+            }
+        };
+        let image = egui::ColorImage::from_rgba_unmultiplied([event.width, event.height], &pixels);
+        if let Some(texture) = &mut self.preview_texture {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.preview_texture = Some(context.load_texture(
+                "goosy-live-preview",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        self.preview_frame = event.frame;
+        let _ = std::fs::remove_file(path);
+        context.request_repaint();
+    }
+
+    fn stop_render(&mut self) {
+        let result = terminate_render_child(&mut self.render_child);
+        self.progress_receiver = None;
+        self.log_receiver = None;
+        self.cleanup_preview_directory();
+        self.render_stage = "渲染已急停".to_owned();
+        self.status = match result {
+            Ok(true) => "渲染已急停；输出文件可能不完整".to_owned(),
+            Ok(false) => "渲染进程已经结束".to_owned(),
+            Err(error) => format!("急停渲染失败：{error}"),
+        };
+    }
+
     fn start_render(&mut self) {
         let (Some(audio), Some(output)) = (self.audio.clone(), self.output.clone()) else {
             self.status = "请先选择音频和输出".to_owned();
@@ -456,6 +601,12 @@ impl GoosyApp {
             self.status = message;
             return;
         }
+        self.cleanup_preview_directory();
+        let preview_directory = new_preview_directory();
+        if let Err(error) = std::fs::create_dir_all(&preview_directory) {
+            self.status = format!("创建实时预览目录失败：{error}");
+            return;
+        }
         let mut command = Command::new(executable);
         command.arg("render").arg(audio);
         if let Some(lyrics) = lyrics {
@@ -470,9 +621,31 @@ impl GoosyApp {
             .arg(self.height.to_string())
             .arg("--fps")
             .arg(self.fps.to_string())
+            .arg("--font-scale")
+            .arg(format!("{:.2}", self.font_scale_percent as f32 / 100.0))
+            .arg("--line-height-scale")
+            .arg(format!("{:.2}", self.line_height_percent as f32 / 100.0))
+            .arg("--line-spacing-scale")
+            .arg(format!("{:.2}", self.line_spacing_percent as f32 / 100.0))
+            .arg("--translation-gap-scale")
+            .arg(format!(
+                "{:.2}",
+                self.translation_gap_percent as f32 / 100.0
+            ))
+            .arg("--background-gap-scale")
+            .arg(format!("{:.2}", self.background_gap_percent as f32 / 100.0))
+            .arg("--horizontal-padding-scale")
+            .arg(format!(
+                "{:.2}",
+                self.horizontal_padding_percent as f32 / 100.0
+            ))
             .arg("--format")
             .arg("auto")
             .arg("--progress-events")
+            .arg("--preview-dir")
+            .arg(&preview_directory)
+            .arg("--preview-interval")
+            .arg(self.preview_interval.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if self.no_audio {
@@ -519,6 +692,9 @@ impl GoosyApp {
                 self.render_child = Some(child);
                 self.progress_receiver = Some(progress_receiver);
                 self.log_receiver = Some(log_receiver);
+                self.preview_directory = Some(preview_directory);
+                self.preview_texture = None;
+                self.preview_frame = 0;
                 self.progress = 0.0;
                 self.speed_history.clear();
                 self.current_speed = 0.0;
@@ -528,6 +704,7 @@ impl GoosyApp {
                 self.status = "渲染进程已启动，等待首帧…".to_owned();
             }
             Err(error) => {
+                let _ = std::fs::remove_dir_all(preview_directory);
                 let message = format!("启动渲染失败：{error}");
                 self.status = message;
             }
@@ -535,9 +712,16 @@ impl GoosyApp {
     }
 
     fn poll_render(&mut self, context: &egui::Context) {
+        let mut latest_preview = None;
         if let Some(receiver) = &self.progress_receiver {
             let lines: Vec<_> = receiver.try_iter().collect();
             for line in lines {
+                if let Some(event) = parse_preview_event(&line) {
+                    if let Some(previous) = latest_preview.replace(event) {
+                        self.discard_preview(previous);
+                    }
+                    continue;
+                }
                 let mut fields = line.split_whitespace();
                 match fields.next() {
                     Some("GOOSY_STAGE") => {
@@ -584,6 +768,9 @@ impl GoosyApp {
                 }
             }
         }
+        if let Some(event) = latest_preview {
+            self.load_preview(context, event);
+        }
         if let Some(receiver) = &self.log_receiver {
             let lines: Vec<_> = receiver.try_iter().collect();
             for line in lines {
@@ -610,6 +797,7 @@ impl GoosyApp {
                 self.render_child = None;
                 self.progress_receiver = None;
                 self.log_receiver = None;
+                self.cleanup_preview_directory();
                 self.progress = if status.success() { 1.0 } else { self.progress };
                 if status.success() {
                     self.status = "渲染完成".to_owned();
@@ -622,6 +810,7 @@ impl GoosyApp {
                 self.render_child = None;
                 self.progress_receiver = None;
                 self.log_receiver = None;
+                self.cleanup_preview_directory();
                 let message = format!("读取渲染状态失败：{error}");
                 self.status = message;
             }
@@ -676,6 +865,267 @@ impl GoosyApp {
         );
     }
 
+    fn draw_render_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("素材与输出");
+        ui.label("选择音频后自动匹配同名歌词与封面。");
+        ui.add_space(4.0);
+        egui::Grid::new("source_grid")
+            .num_columns(2)
+            .spacing([8.0, 8.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("音频");
+                ui.horizontal(|ui| {
+                    let name = self
+                        .audio
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("尚未选择");
+                    ui.label(name);
+                    if ui.button("选择…").clicked() {
+                        self.choose_audio();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("歌词");
+                let previous_lyrics = self.selected_lyrics;
+                ui.horizontal(|ui| {
+                    if self.lyrics_candidates.is_empty() {
+                        ui.label("自动读取内嵌歌词");
+                    } else {
+                        let selected = Self::selected_name(
+                            &self.lyrics_candidates,
+                            self.selected_lyrics,
+                            "选择歌词",
+                        );
+                        egui::ComboBox::from_id_salt("lyrics_combo")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for (index, path) in self.lyrics_candidates.iter().enumerate() {
+                                    let name = path
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("lyrics");
+                                    ui.selectable_value(
+                                        &mut self.selected_lyrics,
+                                        Some(index),
+                                        name,
+                                    );
+                                }
+                            });
+                    }
+                    if ui.button("手动…").clicked() {
+                        self.choose_lyrics();
+                    }
+                });
+                ui.end_row();
+                if previous_lyrics != self.selected_lyrics {
+                    self.reload_lyrics_preview();
+                }
+
+                ui.label("封面");
+                ui.horizontal(|ui| {
+                    let selected = Self::selected_name(
+                        &self.cover_candidates,
+                        self.selected_cover,
+                        "不显示封面",
+                    );
+                    if self.cover_candidates.is_empty() {
+                        ui.label(if self.use_embedded_cover {
+                            "使用内嵌封面"
+                        } else {
+                            "未找到封面"
+                        });
+                    } else {
+                        egui::ComboBox::from_id_salt("cover_combo")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.selected_cover, None, "不显示封面");
+                                for (index, path) in self.cover_candidates.iter().enumerate() {
+                                    let name = path
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("cover");
+                                    ui.selectable_value(
+                                        &mut self.selected_cover,
+                                        Some(index),
+                                        name,
+                                    );
+                                }
+                            });
+                    }
+                    if ui.button("手动…").clicked() {
+                        self.choose_cover();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("歌曲名称");
+                ui.text_edit_singleline(&mut self.title);
+                ui.end_row();
+
+                ui.label("输出文件");
+                ui.horizontal(|ui| {
+                    let display = self
+                        .output
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("选择音频后自动生成");
+                    let response = ui.label(display);
+                    if let Some(output) = &self.output {
+                        response.on_hover_text(output.display().to_string());
+                    }
+                    if ui.button("选择…").clicked() {
+                        if let Some(path) =
+                            FileDialog::new().set_file_name("lyrics.mp4").save_file()
+                        {
+                            self.output = Some(path);
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+
+        ui.add_space(6.0);
+        ui.group(|ui| {
+            ui.strong("输出参数");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("尺寸");
+                ui.add(
+                    egui::DragValue::new(&mut self.width)
+                        .range(320..=7680)
+                        .suffix(" px"),
+                );
+                ui.label("×");
+                ui.add(
+                    egui::DragValue::new(&mut self.height)
+                        .range(180..=4320)
+                        .suffix(" px"),
+                );
+                ui.label("帧率");
+                ui.add(
+                    egui::DragValue::new(&mut self.fps)
+                        .range(1..=120)
+                        .suffix(" fps"),
+                );
+            });
+            egui::CollapsingHeader::new("歌词样式")
+                .default_open(true)
+                .show(ui, |ui| {
+                    style_percent_slider(ui, "字号", &mut self.font_scale_percent, 50..=200);
+                    style_percent_slider(ui, "段内行高", &mut self.line_height_percent, 80..=180);
+                    style_percent_slider(ui, "歌词行间距", &mut self.line_spacing_percent, 0..=200);
+                    style_percent_slider(
+                        ui,
+                        "翻译间距",
+                        &mut self.translation_gap_percent,
+                        0..=200,
+                    );
+                    style_percent_slider(ui, "伴唱间距", &mut self.background_gap_percent, 0..=200);
+                    style_percent_slider(
+                        ui,
+                        "左右留白",
+                        &mut self.horizontal_padding_percent,
+                        0..=200,
+                    );
+                });
+            ui.horizontal(|ui| {
+                ui.label("预览间隔");
+                ui.add(
+                    egui::DragValue::new(&mut self.preview_interval)
+                        .range(1..=300)
+                        .suffix(" 帧/次"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.use_embedded_cover, "使用内嵌封面");
+                ui.checkbox(&mut self.no_audio, "不输出音频");
+            });
+        });
+    }
+
+    fn draw_render_monitor(&mut self, ui: &mut egui::Ui) {
+        ui.heading("渲染状态");
+        let running = self.render_child.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("开始渲染"))
+                .clicked()
+            {
+                self.start_render();
+            }
+            if running
+                && ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("急停")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(176, 32, 48)),
+                    )
+                    .clicked()
+            {
+                self.stop_render();
+            }
+            if self.render_child.is_some() {
+                ui.spinner();
+            }
+        });
+        if self.render_child.is_some() {
+            ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+        }
+        if let Some(texture) = &self.preview_texture {
+            ui.add_space(4.0);
+            ui.label(format!("实时预览 · 第 {} 帧", self.preview_frame));
+            ui.add(
+                egui::Image::new(texture)
+                    .max_width(ui.available_width())
+                    .max_height(260.0)
+                    .maintain_aspect_ratio(true),
+            );
+        } else if !running {
+            ui.weak("开始渲染后将在这里显示实时画面。");
+        }
+        if !self.speed_history.is_empty() {
+            self.draw_speed_graph(ui);
+        }
+        if !self.status.is_empty() {
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("render_status")
+                .max_height(90.0)
+                .show(ui, |ui| {
+                    ui.label(&self.status);
+                });
+        }
+    }
+
+    fn draw_render_page(&mut self, ui: &mut egui::Ui) {
+        if render_page_uses_columns(ui.available_width()) {
+            ui.columns(2, |columns| {
+                let (left, right) = columns.split_at_mut(1);
+                egui::ScrollArea::vertical()
+                    .id_salt("render_settings_scroll")
+                    .show(&mut left[0], |ui| self.draw_render_settings(ui));
+                egui::ScrollArea::vertical()
+                    .id_salt("render_monitor_scroll")
+                    .show(&mut right[0], |ui| self.draw_render_monitor(ui));
+            });
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("render_compact_scroll")
+                .show(ui, |ui| {
+                    self.draw_render_settings(ui);
+                    ui.separator();
+                    self.draw_render_monitor(ui);
+                });
+        }
+    }
+
     fn selected_name(paths: &[PathBuf], index: Option<usize>, empty: &str) -> String {
         index
             .and_then(|index| paths.get(index))
@@ -683,6 +1133,13 @@ impl GoosyApp {
             .and_then(|name| name.to_str())
             .map(str::to_owned)
             .unwrap_or_else(|| empty.to_owned())
+    }
+}
+
+impl Drop for GoosyApp {
+    fn drop(&mut self) {
+        let _ = terminate_render_child(&mut self.render_child);
+        self.cleanup_preview_directory();
     }
 }
 
@@ -707,178 +1164,7 @@ impl eframe::App for GoosyApp {
             });
             ui.separator();
             if self.page == AppPage::Render {
-                ui.label("选择音频后，自动匹配同名歌词与封面。");
-                ui.add_space(8.0);
-
-                egui::Grid::new("source_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 12.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label("音频");
-                        ui.horizontal(|ui| {
-                            let name = self
-                                .audio
-                                .as_ref()
-                                .and_then(|path| path.file_name())
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("尚未选择");
-                            ui.label(name);
-                            if ui.button("选择音频…").clicked() {
-                                self.choose_audio();
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("歌词");
-                        let previous_lyrics = self.selected_lyrics;
-                        ui.horizontal(|ui| {
-                            if self.lyrics_candidates.is_empty() {
-                                ui.label("未找到同名歌词，将读取音频内嵌歌词");
-                            } else {
-                                let selected = Self::selected_name(
-                                    &self.lyrics_candidates,
-                                    self.selected_lyrics,
-                                    "选择歌词",
-                                );
-                                egui::ComboBox::from_id_salt("lyrics_combo")
-                                    .selected_text(selected)
-                                    .show_ui(ui, |ui| {
-                                        for (index, path) in
-                                            self.lyrics_candidates.iter().enumerate()
-                                        {
-                                            let name = path
-                                                .file_name()
-                                                .and_then(|name| name.to_str())
-                                                .unwrap_or("lyrics");
-                                            ui.selectable_value(
-                                                &mut self.selected_lyrics,
-                                                Some(index),
-                                                name,
-                                            );
-                                        }
-                                    });
-                            }
-                            if ui.button("手动选择…").clicked() {
-                                self.choose_lyrics();
-                            }
-                        });
-                        ui.end_row();
-                        if previous_lyrics != self.selected_lyrics {
-                            self.reload_lyrics_preview();
-                        }
-
-                        ui.label("封面");
-                        ui.horizontal(|ui| {
-                            let selected = Self::selected_name(
-                                &self.cover_candidates,
-                                self.selected_cover,
-                                "不显示封面",
-                            );
-                            if !self.cover_candidates.is_empty() {
-                                egui::ComboBox::from_id_salt("cover_combo")
-                                    .selected_text(selected)
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.selected_cover,
-                                            None,
-                                            "不显示封面",
-                                        );
-                                        for (index, path) in
-                                            self.cover_candidates.iter().enumerate()
-                                        {
-                                            let name = path
-                                                .file_name()
-                                                .and_then(|name| name.to_str())
-                                                .unwrap_or("cover");
-                                            ui.selectable_value(
-                                                &mut self.selected_cover,
-                                                Some(index),
-                                                name,
-                                            );
-                                        }
-                                    });
-                            } else {
-                                ui.label(if self.use_embedded_cover {
-                                    "将使用音频内嵌封面"
-                                } else {
-                                    "未找到同名封面"
-                                });
-                            }
-                            if ui.button("手动选择…").clicked() {
-                                self.choose_cover();
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("歌曲名称");
-                        ui.text_edit_singleline(&mut self.title);
-                        ui.end_row();
-
-                        ui.label("输出文件");
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                self.output
-                                    .as_ref()
-                                    .map(|path| path.display().to_string())
-                                    .unwrap_or_else(|| "选择音频后自动生成".to_owned()),
-                            );
-                            if ui.button("选择输出…").clicked() {
-                                if let Some(path) =
-                                    FileDialog::new().set_file_name("lyrics.mp4").save_file()
-                                {
-                                    self.output = Some(path);
-                                }
-                            }
-                        });
-                        ui.end_row();
-                    });
-
-                ui.separator();
-                ui.collapsing("输出设置", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("尺寸");
-                        ui.add(
-                            egui::DragValue::new(&mut self.width)
-                                .range(320..=7680)
-                                .suffix(" px"),
-                        );
-                        ui.label("×");
-                        ui.add(
-                            egui::DragValue::new(&mut self.height)
-                                .range(180..=4320)
-                                .suffix(" px"),
-                        );
-                        ui.label("帧率");
-                        ui.add(
-                            egui::DragValue::new(&mut self.fps)
-                                .range(1..=120)
-                                .suffix(" fps"),
-                        );
-                    });
-                    ui.checkbox(&mut self.use_embedded_cover, "默认使用音频内嵌封面");
-                    ui.checkbox(&mut self.no_audio, "不输出音频");
-                });
-
-                ui.add_space(12.0);
-                let running = self.render_child.is_some();
-                if ui
-                    .add_enabled(!running, egui::Button::new("开始渲染"))
-                    .clicked()
-                {
-                    self.start_render();
-                }
-                if running {
-                    ui.spinner();
-                    ui.add(egui::ProgressBar::new(self.progress).show_percentage());
-                }
-                if !self.speed_history.is_empty() {
-                    self.draw_speed_graph(ui);
-                }
-                if !self.status.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(&self.status);
-                }
+                self.draw_render_page(ui);
             } else {
                 self.draw_lyrics_page(ui);
             }
@@ -959,7 +1245,11 @@ fn detect_credit_lines(lines: &[lrc::LyricLine]) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{COVER_EXTENSIONS, LYRIC_EXTENSIONS, detect_credit_lines, has_extension};
+    use super::{
+        COVER_EXTENSIONS, GoosyApp, LYRIC_EXTENSIONS, PreviewEvent, detect_credit_lines,
+        has_extension, new_preview_directory, parse_preview_event, render_page_uses_columns,
+        terminate_render_child,
+    };
     use libgoosy::lrc::LyricLine;
 
     fn line(text: &str) -> LyricLine {
@@ -999,5 +1289,106 @@ mod tests {
         let mut lines = vec![line("普通歌词"); 10];
         lines[5] = line("作曲的旋律");
         assert!(!detect_credit_lines(&lines)[5]);
+    }
+
+    #[test]
+    fn parses_complete_preview_events_only() {
+        assert_eq!(
+            parse_preview_event("GOOSY_PREVIEW 45 640 360"),
+            Some(PreviewEvent {
+                frame: 45,
+                width: 640,
+                height: 360,
+            })
+        );
+        assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 0 360"), None);
+        assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 640"), None);
+        assert_eq!(parse_preview_event("GOOSY_PROGRESS 45 300 1.0"), None);
+    }
+
+    #[test]
+    fn terminates_a_running_render_child() {
+        if std::env::var_os("GOOSY_TERMINATION_FIXTURE").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let executable = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "gui::tests::terminates_a_running_render_child",
+                "--nocapture",
+            ])
+            .env("GOOSY_TERMINATION_FIXTURE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = Some(child);
+
+        assert!(terminate_render_child(&mut child).unwrap());
+        assert!(child.is_none());
+    }
+
+    #[test]
+    fn loads_preview_into_texture_and_removes_staging_frame() {
+        let directory = new_preview_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("7.rgba");
+        std::fs::write(&path, [255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        let mut app = GoosyApp::default();
+        app.preview_directory = Some(directory);
+        let context = eframe::egui::Context::default();
+
+        app.load_preview(
+            &context,
+            PreviewEvent {
+                frame: 7,
+                width: 2,
+                height: 1,
+            },
+        );
+
+        assert_eq!(app.preview_frame, 7);
+        assert_eq!(app.preview_texture.as_ref().unwrap().size(), [2, 1]);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn render_page_switches_to_a_scrollable_single_column_on_narrow_windows() {
+        assert!(!render_page_uses_columns(700.0));
+        assert!(render_page_uses_columns(760.0));
+        assert!(render_page_uses_columns(960.0));
+    }
+
+    #[test]
+    fn render_page_stays_within_default_and_minimum_viewports() {
+        for size in [
+            eframe::egui::vec2(960.0, 620.0),
+            eframe::egui::vec2(700.0, 480.0),
+        ] {
+            let context = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    size,
+                )),
+                ..Default::default()
+            };
+            let mut app = GoosyApp::default();
+
+            let mut output = context.run_ui(input, |ui| app.draw_render_page(ui));
+            output.textures_delta.clear();
+
+            let used = context.globally_used_rect();
+            assert!(
+                used.width() <= size.x + 1.0,
+                "used={used:?}, viewport={size:?}"
+            );
+            assert!(
+                used.height() <= size.y + 1.0,
+                "used={used:?}, viewport={size:?}"
+            );
+        }
     }
 }

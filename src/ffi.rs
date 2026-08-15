@@ -85,6 +85,48 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
             .ok_or_else(|| "request.fps must be a positive integer".to_owned())?
             as u32;
     }
+    if let Some(value) = object.get("font_scale") {
+        options.lyrics_style.font_scale = value
+            .as_f64()
+            .filter(|scale| scale.is_finite() && (0.5..=2.0).contains(scale))
+            .ok_or_else(|| "request.font_scale must be between 0.5 and 2.0".to_owned())?
+            as f32;
+    }
+    for (key, target, minimum) in [
+        (
+            "line_height_scale",
+            &mut options.lyrics_style.line_height_scale,
+            0.8,
+        ),
+        (
+            "line_spacing_scale",
+            &mut options.lyrics_style.group_gap_scale,
+            0.0,
+        ),
+        (
+            "translation_gap_scale",
+            &mut options.lyrics_style.translation_gap_scale,
+            0.0,
+        ),
+        (
+            "background_gap_scale",
+            &mut options.lyrics_style.background_gap_scale,
+            0.0,
+        ),
+        (
+            "horizontal_padding_scale",
+            &mut options.lyrics_style.horizontal_padding_scale,
+            0.0,
+        ),
+    ] {
+        if let Some(value) = object.get(key) {
+            *target = value
+                .as_f64()
+                .filter(|scale| scale.is_finite() && (minimum..=2.0).contains(scale))
+                .ok_or_else(|| format!("request.{key} must be between {minimum} and 2.0"))?
+                as f32;
+        }
+    }
     if let Some(value) = object.get("no_embedded_cover") {
         options.no_embedded_cover = value
             .as_bool()
@@ -242,5 +284,44 @@ pub unsafe extern "C" fn goosy_parse_lyrics_json(
             set_error("Goosy panicked while parsing lyrics");
             std::ptr::null_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_options;
+
+    #[test]
+    fn parses_all_lyrics_style_scales() {
+        let options = request_options(
+            r#"{
+                "song":"song.wav",
+                "output":"out.mp4",
+                "font_scale":1.25,
+                "line_height_scale":1.4,
+                "line_spacing_scale":1.6,
+                "translation_gap_scale":0.5,
+                "background_gap_scale":1.8,
+                "horizontal_padding_scale":1.2
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(options.lyrics_style.font_scale, 1.25);
+        assert_eq!(options.lyrics_style.line_height_scale, 1.4);
+        assert_eq!(options.lyrics_style.group_gap_scale, 1.6);
+        assert_eq!(options.lyrics_style.translation_gap_scale, 0.5);
+        assert_eq!(options.lyrics_style.background_gap_scale, 1.8);
+        assert_eq!(options.lyrics_style.horizontal_padding_scale, 1.2);
+    }
+
+    #[test]
+    fn rejects_out_of_range_lyrics_style_scales() {
+        let error = request_options(
+            r#"{"song":"song.wav","output":"out.mp4","line_height_scale":0.5}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("line_height_scale"));
     }
 }

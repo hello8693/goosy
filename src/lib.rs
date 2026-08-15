@@ -29,6 +29,7 @@ pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 pub use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
+pub use lyrics_renderer::LyricsStyle;
 pub use pdf_renderer::{PdfOptions, render_lyrics_pdf};
 pub use renderer::Renderer;
 use std::fs;
@@ -58,6 +59,7 @@ pub struct RenderOptions {
     pub no_embedded_cover: bool,
     pub no_audio: bool,
     pub render_translation: bool,
+    pub lyrics_style: LyricsStyle,
     pub render_background_vocal: bool,
     pub excluded_lines: Vec<usize>,
     pub format: LyricFormat,
@@ -78,6 +80,7 @@ impl RenderOptions {
             no_embedded_cover: false,
             no_audio: false,
             render_translation: true,
+            lyrics_style: LyricsStyle::default(),
             render_background_vocal: true,
             excluded_lines: Vec::new(),
             format: LyricFormat::Auto,
@@ -102,6 +105,15 @@ pub fn render(options: &RenderOptions) -> anyhow::Result<()> {
 pub fn render_with_progress<F>(options: &RenderOptions, mut on_progress: F) -> anyhow::Result<()>
 where
     F: FnMut(u64, u64, f64),
+{
+    render_with_frame_progress(options, |done, total, elapsed, _pixels| {
+        on_progress(done, total, elapsed);
+    })
+}
+
+pub fn render_with_frame_progress<F>(options: &RenderOptions, mut on_frame: F) -> anyhow::Result<()>
+where
+    F: FnMut(u64, u64, f64, &[u8]),
 {
     if options.width == 0 || options.height == 0 || options.fps == 0 {
         anyhow::bail!("width, height, and fps must be positive");
@@ -154,6 +166,7 @@ where
         cover_layer,
         options.render_translation,
         options.render_background_vocal,
+        options.lyrics_style,
         &options.excluded_lines,
     )?;
     let mut writer = video::AsyncVideoWriter::new(
@@ -170,13 +183,14 @@ where
     for frame in 0..total_frames {
         let t_ms = frame * 1_000 / options.fps as u64;
         renderer.render_frame_into(t_ms, &mut rgba)?;
-        writer.submit_frame(&mut rgba)?;
         progress.inc(1);
-        on_progress(
+        on_frame(
             frame + 1,
             total_frames,
             render_started.elapsed().as_secs_f64(),
+            &rgba,
         );
+        writer.submit_frame(&mut rgba)?;
     }
     writer.finish()?;
     progress.finish_and_clear();
