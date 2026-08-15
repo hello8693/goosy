@@ -5,7 +5,7 @@ use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, RectHeightStyle, RectWidthStyle,
     TextAlign, TextBox, TextHeightBehavior, TextStyle,
 };
-use skia_safe::{Canvas, Color, FontMgr, FontStyle, Paint, PathBuilder, Point, Rect};
+use skia_safe::{Canvas, Color, FontMgr, FontStyle, Paint, PaintStyle, PathBuilder, Point, Rect};
 use std::cell::RefCell;
 
 use crate::easing::bez_in;
@@ -29,6 +29,7 @@ pub struct LyricsStyle {
     pub translation_gap_scale: f32,
     pub background_gap_scale: f32,
     pub horizontal_padding_scale: f32,
+    pub debug_overlays: bool,
 }
 
 impl Default for LyricsStyle {
@@ -40,6 +41,7 @@ impl Default for LyricsStyle {
             translation_gap_scale: 1.0,
             background_gap_scale: 1.0,
             horizontal_padding_scale: 1.0,
+            debug_overlays: false,
         }
     }
 }
@@ -386,7 +388,132 @@ impl LyricsRenderer {
             }
             canvas.restore_to_count(transform);
         }
+        if self.style.debug_overlays {
+            self.draw_debug_overlays(canvas, lines, layout, height);
+        }
         Ok(())
+    }
+    fn draw_debug_overlays(
+        &self,
+        canvas: &Canvas,
+        lines: &[LyricLine],
+        layout: &Layout,
+        height: u32,
+    ) {
+        let mut paint = Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_style(PaintStyle::Stroke);
+        paint.set_stroke_width(2.0);
+        for (index, line) in lines.iter().enumerate() {
+            let top_y = layout.pos_y[index].current_position() as f32;
+            let group_height = self.group_heights[index] as f32;
+            if top_y + group_height < 0.0 || top_y > height as f32 {
+                continue;
+            }
+
+            // Yellow: complete lyric-group container.
+            paint.set_color(Color::from_argb(230, 255, 220, 0));
+            canvas.draw_rect(
+                Rect::from_xywh(self.margin_x, top_y, self.text_width, group_height),
+                &paint,
+            );
+
+            // Red: main-lyric paragraph container.
+            paint.set_color(Color::from_argb(230, 255, 50, 50));
+            canvas.draw_rect(
+                Rect::from_xywh(
+                    self.margin_x,
+                    top_y,
+                    self.text_width,
+                    self.base_heights[index],
+                ),
+                &paint,
+            );
+
+            // White: tight boxes reported for each main visual line.
+            if !line.text.is_empty() {
+                let end = line.text.encode_utf16().count();
+                for text_box in self.base_paragraphs[index].get_rects_for_range(
+                    0..end,
+                    RectHeightStyle::Tight,
+                    RectWidthStyle::Tight,
+                ) {
+                    paint.set_color(Color::from_argb(230, 255, 255, 255));
+                    let mut rect = text_box.rect;
+                    rect.offset((self.margin_x, top_y));
+                    canvas.draw_rect(rect, &paint);
+                }
+            }
+
+            let translation_height = self.translation_heights[index];
+            if translation_height > 0.0 {
+                let translation_top = top_y
+                    + self.base_heights[index]
+                    + self.main_font_size * TRANSLATION_GAP_EM * self.style.translation_gap_scale;
+                // Green: translation paragraph container.
+                paint.set_color(Color::from_argb(230, 50, 255, 100));
+                canvas.draw_rect(
+                    Rect::from_xywh(
+                        self.margin_x,
+                        translation_top,
+                        self.text_width,
+                        translation_height,
+                    ),
+                    &paint,
+                );
+            }
+            if index + 1 < lines.len() {
+                // Orange: pure inter-group gap; it must not contain text.
+                paint.set_color(Color::from_argb(230, 255, 100, 0));
+                canvas.draw_rect(
+                    Rect::from_xywh(
+                        self.margin_x,
+                        top_y + group_height,
+                        self.text_width,
+                        self.group_gap as f32,
+                    ),
+                    &paint,
+                );
+            }
+
+            if self.background_lines[index].is_none() {
+                continue;
+            }
+            let background_height = self.background_paragraphs[index]
+                .as_ref()
+                .map(Paragraph::height)
+                .unwrap_or(0.0);
+            let background_translation_height = self.background_translation_paragraphs[index]
+                .as_ref()
+                .map(Paragraph::height)
+                .unwrap_or(0.0);
+            let translation_gap = if translation_height > 0.0 {
+                self.main_font_size * TRANSLATION_GAP_EM * self.style.translation_gap_scale
+            } else {
+                0.0
+            };
+            let background_gap = if background_height > 0.0 {
+                self.main_font_size * BACKGROUND_GAP_EM * self.style.background_gap_scale
+            } else {
+                0.0
+            };
+            let background_top = top_y
+                + self.base_heights[index]
+                + translation_height
+                + translation_gap
+                + background_gap;
+            // Blue: background-vocal paragraph container.
+            paint.set_color(Color::from_argb(230, 50, 150, 255));
+            canvas.draw_rect(
+                Rect::from_xywh(
+                    self.margin_x,
+                    background_top,
+                    self.text_width,
+                    background_height + background_translation_height,
+                ),
+                &paint,
+            );
+        }
     }
 
     fn draw_group(
@@ -1493,5 +1620,9 @@ mod tests {
         assert!(main_glyph_height > 0.0);
         let ratio = renderer.group_gap as f32 / main_glyph_height;
         assert!((ratio - DEFAULT_LINE_GAP_MULTIPLIER).abs() < 0.000_01);
+    }
+    #[test]
+    fn debug_overlays_are_opt_in() {
+        assert!(!LyricsStyle::default().debug_overlays);
     }
 }

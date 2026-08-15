@@ -19,3 +19,4 @@
 testdata/
 testdata/*
 dist/
+.omp/

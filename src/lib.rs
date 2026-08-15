@@ -63,6 +63,8 @@ pub struct RenderOptions {
     pub render_background_vocal: bool,
     pub excluded_lines: Vec<usize>,
     pub format: LyricFormat,
+    pub sample_start_ms: Option<u64>,
+    pub sample_duration_ms: Option<u64>,
 }
 
 impl RenderOptions {
@@ -84,8 +86,17 @@ impl RenderOptions {
             render_background_vocal: true,
             excluded_lines: Vec::new(),
             format: LyricFormat::Auto,
+            sample_start_ms: None,
+            sample_duration_ms: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderControl {
+    Continue,
+    Pause,
+    Stop,
 }
 
 pub fn parse_lyrics(input: &str, format: LyricFormat) -> anyhow::Result<Vec<LyricLine>> {
@@ -106,14 +117,30 @@ pub fn render_with_progress<F>(options: &RenderOptions, mut on_progress: F) -> a
 where
     F: FnMut(u64, u64, f64),
 {
-    render_with_frame_progress(options, |done, total, elapsed, _pixels| {
-        on_progress(done, total, elapsed);
-    })
+    render_with_frame_progress_control(
+        options,
+        |done, total, elapsed, _pixels| {
+            on_progress(done, total, elapsed);
+        },
+        || RenderControl::Continue,
+    )
 }
 
-pub fn render_with_frame_progress<F>(options: &RenderOptions, mut on_frame: F) -> anyhow::Result<()>
+pub fn render_with_frame_progress<F>(options: &RenderOptions, on_frame: F) -> anyhow::Result<()>
 where
     F: FnMut(u64, u64, f64, &[u8]),
+{
+    render_with_frame_progress_control(options, on_frame, || RenderControl::Continue)
+}
+
+pub fn render_with_frame_progress_control<F, C>(
+    options: &RenderOptions,
+    mut on_frame: F,
+    mut control: C,
+) -> anyhow::Result<()>
+where
+    F: FnMut(u64, u64, f64, &[u8]),
+    C: FnMut() -> RenderControl,
 {
     if options.width == 0 || options.height == 0 || options.fps == 0 {
         anyhow::bail!("width, height, and fps must be positive");
@@ -130,12 +157,20 @@ where
     };
     let lines = parse_lyrics(&text, options.format)?;
     let last_line_end_ms = lines.iter().map(|line| line.end_ms).max().unwrap_or(0);
-    let duration_seconds = if options.no_audio {
-        last_line_end_ms as f64 / 1_000.0 + 1.0
+    let full_duration_ms = if options.no_audio {
+        last_line_end_ms.saturating_add(1_000)
     } else {
-        metadata.duration_seconds
+        (metadata.duration_seconds * 1_000.0).ceil() as u64
     };
-    let total_frames = (duration_seconds * options.fps as f64).ceil() as u64;
+    let render_start_ms = options.sample_start_ms.unwrap_or(0).min(full_duration_ms);
+    let render_duration_ms = options
+        .sample_duration_ms
+        .unwrap_or(full_duration_ms.saturating_sub(render_start_ms))
+        .min(full_duration_ms.saturating_sub(render_start_ms));
+    if render_duration_ms == 0 {
+        anyhow::bail!("render duration must be positive");
+    }
+    let total_frames = (render_duration_ms as f64 / 1_000.0 * options.fps as f64).ceil() as u64;
     let embedded_cover = if options.cover.is_none() && !options.no_embedded_cover {
         video::embedded_cover_image(&options.song)?
     } else {
@@ -181,7 +216,14 @@ where
     let mut rgba = Vec::new();
     let render_started = Instant::now();
     for frame in 0..total_frames {
-        let t_ms = frame * 1_000 / options.fps as u64;
+        loop {
+            match control() {
+                RenderControl::Continue => break,
+                RenderControl::Pause => std::thread::sleep(std::time::Duration::from_millis(40)),
+                RenderControl::Stop => anyhow::bail!("render stopped by user"),
+            }
+        }
+        let t_ms = render_start_ms + frame * 1_000 / options.fps as u64;
         renderer.render_frame_into(t_ms, &mut rgba)?;
         progress.inc(1);
         on_frame(

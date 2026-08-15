@@ -2,10 +2,11 @@ use anyhow::Result;
 #[cfg(target_os = "windows")]
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use libgoosy::{LyricFormat, LyricsStyle, RenderOptions};
-use std::io::Write;
+use libgoosy::{LyricFormat, LyricsStyle, RenderControl, RenderOptions};
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
-
+use std::sync::mpsc;
+use std::thread;
 #[derive(Parser)]
 #[command(
     name = "goosy-render-worker",
@@ -42,6 +43,12 @@ enum Command {
         background_gap_scale: f32,
         #[arg(long, default_value_t = 1.0)]
         horizontal_padding_scale: f32,
+        #[arg(long, help = "draw lyric containers, glyph boxes, and gaps")]
+        debug_overlays: bool,
+        #[arg(long, hide = true)]
+        sample_start_ms: Option<u64>,
+        #[arg(long, hide = true)]
+        sample_duration_ms: Option<u64>,
         #[arg(long)]
         background: Option<PathBuf>,
         #[arg(long)]
@@ -338,6 +345,9 @@ fn main() -> Result<()> {
             translation_gap_scale,
             background_gap_scale,
             horizontal_padding_scale,
+            debug_overlays,
+            sample_start_ms,
+            sample_duration_ms,
             background,
             cover,
             title,
@@ -371,6 +381,7 @@ fn main() -> Result<()> {
                     translation_gap_scale,
                     background_gap_scale,
                     horizontal_padding_scale,
+                    debug_overlays,
                 },
                 background,
                 cover,
@@ -381,40 +392,76 @@ fn main() -> Result<()> {
                 render_background_vocal: !no_background_vocal,
                 excluded_lines: exclude_lines,
                 format: format.into(),
+                sample_start_ms,
+                sample_duration_ms,
             };
             let mut preview_dir = preview_dir;
             let mut preview_pixels = Vec::new();
-            libgoosy::render_with_frame_progress(&options, |done, total, elapsed, pixels| {
-                if progress_events {
-                    println!("GOOSY_PROGRESS {done} {total} {elapsed:.3}");
+            let (control_sender, control_receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let stdin = std::io::stdin();
+                for command in stdin.lock().lines().map_while(Result::ok) {
+                    let _ = control_sender.send(command.trim().to_owned());
                 }
-                let preview_due = done == 1 || done == total || done % preview_interval == 0;
-                if preview_due {
-                    let result = preview_dir.as_deref().map(|directory| {
-                        write_preview_frame(
-                            directory,
-                            done,
-                            pixels,
-                            width,
-                            height,
-                            &mut preview_pixels,
-                        )
-                    });
-                    match result {
-                        Some(Ok((preview_width, preview_height))) => {
-                            println!("GOOSY_PREVIEW {done} {preview_width} {preview_height}");
-                        }
-                        Some(Err(error)) => {
-                            eprintln!("goosy: disable live preview after write failure: {error}");
-                            preview_dir = None;
-                        }
-                        None => {}
+            });
+            let mut paused = false;
+            libgoosy::render_with_frame_progress_control(
+                &options,
+                |done, total, elapsed, pixels| {
+                    if progress_events {
+                        println!("GOOSY_PROGRESS {done} {total} {elapsed:.3}");
                     }
-                }
-                if progress_events || preview_due {
-                    let _ = std::io::stdout().flush();
-                }
-            })
+                    let preview_due = done == 1 || done == total || done % preview_interval == 0;
+                    if preview_due {
+                        let result = preview_dir.as_deref().map(|directory| {
+                            write_preview_frame(
+                                directory,
+                                done,
+                                pixels,
+                                width,
+                                height,
+                                &mut preview_pixels,
+                            )
+                        });
+                        match result {
+                            Some(Ok((preview_width, preview_height))) => {
+                                println!("GOOSY_PREVIEW {done} {preview_width} {preview_height}");
+                            }
+                            Some(Err(error)) => {
+                                eprintln!(
+                                    "goosy: disable live preview after write failure: {error}"
+                                );
+                                preview_dir = None;
+                            }
+                            None => {}
+                        }
+                    }
+                    if progress_events || preview_due {
+                        let _ = std::io::stdout().flush();
+                    }
+                },
+                || loop {
+                    if paused {
+                        match control_receiver.recv() {
+                            Ok(command) if command == "resume" => paused = false,
+                            Ok(command) if command == "stop" => return RenderControl::Stop,
+                            Ok(_) => {}
+                            Err(_) => return RenderControl::Stop,
+                        }
+                    } else {
+                        match control_receiver.try_recv() {
+                            Ok(command) if command == "pause" => paused = true,
+                            Ok(command) if command == "stop" => return RenderControl::Stop,
+                            Ok(_) | Err(mpsc::TryRecvError::Empty) => {
+                                return RenderControl::Continue;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                return RenderControl::Continue;
+                            }
+                        }
+                    }
+                },
+            )
         }
     }
 }

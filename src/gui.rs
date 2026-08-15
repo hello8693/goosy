@@ -1,17 +1,36 @@
 use eframe::egui;
 use libgoosy::{
-    LyricFormat, LyricsStyle, background, cover_renderer, geometry::FrameGeometry, layout::Layout,
-    lrc, lyrics_renderer::LyricsRenderer, video,
+    LyricFormat, LyricsStyle, RenderControl, RenderOptions, background, cover_renderer,
+    geometry::FrameGeometry, layout::Layout, lrc, lyrics_renderer::LyricsRenderer, video,
 };
 use rfd::FileDialog;
 use std::collections::VecDeque;
+use std::io::Write;
+#[cfg(target_os = "windows")]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderLifecycle {
+    Idle,
+    Running,
+    Paused,
+    EmergencyStopped,
+}
+
+struct InternalRenderTask {
+    control: mpsc::Sender<String>,
+    done: mpsc::Receiver<anyhow::Result<()>>,
+    thread: Option<JoinHandle<()>>,
+}
 
 const DEFAULT_PREVIEW_INTERVAL: u64 = 15;
 static PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -50,7 +69,7 @@ struct StylePreviewScene {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StylePreviewKey {
-    style: [u32; 6],
+    style: [u32; 7],
     scene: StylePreviewScene,
 }
 
@@ -317,6 +336,34 @@ fn new_preview_directory() -> PathBuf {
         std::process::id()
     ))
 }
+fn write_internal_preview_frame(
+    directory: &Path,
+    frame: u64,
+    source: &[u8],
+    width: u32,
+    height: u32,
+    preview: &mut Vec<u8>,
+) -> std::io::Result<(u32, u32)> {
+    let scale = (STYLE_PREVIEW_MAX_WIDTH as f32 / width.max(1) as f32)
+        .min(STYLE_PREVIEW_MAX_HEIGHT as f32 / height.max(1) as f32)
+        .min(1.0);
+    let preview_width = (width as f32 * scale).round().max(1.0) as u32;
+    let preview_height = (height as f32 * scale).round().max(1.0) as u32;
+    preview.resize(preview_width as usize * preview_height as usize * 4, 0);
+    for y in 0..preview_height as usize {
+        let source_y = y * height as usize / preview_height as usize;
+        for x in 0..preview_width as usize {
+            let source_x = x * width as usize / preview_width as usize;
+            let source_offset = (source_y * width as usize + source_x) * 4;
+            let preview_offset = (y * preview_width as usize + x) * 4;
+            preview[preview_offset..preview_offset + 4]
+                .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+    std::fs::create_dir_all(directory)?;
+    std::fs::write(directory.join(format!("{frame}.rgba")), preview)?;
+    Ok((preview_width, preview_height))
+}
 
 fn terminate_render_child(child: &mut Option<Child>) -> std::io::Result<bool> {
     let Some(mut child) = child.take() else {
@@ -364,9 +411,13 @@ struct GoosyApp {
     translation_gap_percent: u32,
     background_gap_percent: u32,
     horizontal_padding_percent: u32,
+    debug_overlays: bool,
     use_embedded_cover: bool,
     no_audio: bool,
     render_child: Option<Child>,
+    internal_render: Option<InternalRenderTask>,
+    render_lifecycle: RenderLifecycle,
+    render_sample: bool,
     progress_receiver: Option<mpsc::Receiver<String>>,
     log_receiver: Option<mpsc::Receiver<String>>,
     preview_interval: u64,
@@ -415,9 +466,13 @@ impl Default for GoosyApp {
             translation_gap_percent: 100,
             background_gap_percent: 100,
             horizontal_padding_percent: 100,
+            debug_overlays: false,
             use_embedded_cover: true,
             no_audio: false,
             render_child: None,
+            internal_render: None,
+            render_lifecycle: RenderLifecycle::Idle,
+            render_sample: false,
             progress_receiver: None,
             log_receiver: None,
             preview_interval: DEFAULT_PREVIEW_INTERVAL,
@@ -428,18 +483,18 @@ impl Default for GoosyApp {
             speed_history: VecDeque::new(),
             current_speed: 0.0,
             last_progress_sample: None,
+            style_preview_key: None,
+            style_preview_texture: None,
+            style_preview_error: None,
+            style_preview_sender,
+            style_preview_receiver,
             render_stage: String::new(),
             render_log: String::new(),
             status: String::new(),
             page: AppPage::Render,
             render_translation: true,
-            style_preview_key: None,
-            style_preview_texture: None,
-            style_preview_error: None,
             render_background_vocal: true,
             speed_printer: false,
-            style_preview_sender,
-            style_preview_receiver,
             auto_exclude_credits: false,
             lyric_lines: Vec::new(),
             manual_excluded_lines: Vec::new(),
@@ -762,6 +817,7 @@ impl GoosyApp {
             translation_gap_scale: self.translation_gap_percent as f32 / 100.0,
             background_gap_scale: self.background_gap_percent as f32 / 100.0,
             horizontal_padding_scale: self.horizontal_padding_percent as f32 / 100.0,
+            debug_overlays: self.debug_overlays,
         }
     }
 
@@ -773,6 +829,7 @@ impl GoosyApp {
             self.translation_gap_percent,
             self.background_gap_percent,
             self.horizontal_padding_percent,
+            self.debug_overlays as u32,
         ];
         let cover_path = self
             .selected_cover
@@ -889,22 +946,136 @@ impl GoosyApp {
         context.request_repaint();
     }
 
+    fn send_render_command(&mut self, command: &str) {
+        if let Some(task) = &self.internal_render {
+            let _ = task.control.send(command.to_owned());
+            return;
+        }
+        if let Some(child) = &mut self.render_child {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = writeln!(stdin, "{command}");
+                let _ = stdin.flush();
+            }
+        }
+    }
+
+    fn pause_render(&mut self) {
+        if self.render_lifecycle != RenderLifecycle::Running {
+            return;
+        }
+        self.send_render_command("pause");
+        self.render_lifecycle = RenderLifecycle::Paused;
+        self.status = "渲染已暂停，可继续或重启".to_owned();
+    }
+
+    fn resume_render(&mut self) {
+        if self.render_lifecycle != RenderLifecycle::Paused {
+            return;
+        }
+        self.send_render_command("resume");
+        self.render_lifecycle = RenderLifecycle::Running;
+        self.status = "渲染继续进行".to_owned();
+    }
+
     fn stop_render(&mut self) {
-        let result = terminate_render_child(&mut self.render_child);
-        self.progress_receiver = None;
-        self.log_receiver = None;
-        self.cleanup_preview_directory();
-        self.render_stage = "渲染已急停".to_owned();
-        self.status = match result {
-            Ok(true) => "渲染已急停；输出文件可能不完整".to_owned(),
-            Ok(false) => "渲染进程已经结束".to_owned(),
-            Err(error) => format!("急停渲染失败：{error}"),
+        if self.render_child.is_none() && self.internal_render.is_none() {
+            return;
+        }
+        self.render_lifecycle = RenderLifecycle::EmergencyStopped;
+        self.send_render_command("stop");
+        if self.render_child.is_some() {
+            let result = terminate_render_child(&mut self.render_child);
+            self.progress_receiver = None;
+            self.log_receiver = None;
+            self.cleanup_preview_directory();
+            self.render_stage = "渲染已急停".to_owned();
+            self.status = match result {
+                Ok(true) => "渲染已急停；本次任务不可恢复".to_owned(),
+                Ok(false) => "渲染进程已经结束；本次任务不可恢复".to_owned(),
+                Err(error) => format!("急停渲染失败：{error}"),
+            };
+        } else {
+            self.status = "渲染急停请求已发送；本次任务不可恢复".to_owned();
+        }
+    }
+    fn render_output_path(&self, sample: Option<(u64, u64)>) -> Option<PathBuf> {
+        let output = self.output.clone()?;
+        let Some((start_ms, _)) = sample else {
+            return Some(output);
         };
+        let stem = output.file_stem()?.to_str()?;
+        let extension = output
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("mp4");
+        Some(output.with_file_name(format!("{stem}.sample-{start_ms}ms.{extension}")))
+    }
+
+    fn random_sample_range(&self) -> Option<(u64, u64)> {
+        let end_ms = self
+            .lyric_lines
+            .iter()
+            .map(|line| line.end_ms)
+            .max()?
+            .saturating_add(1_000);
+        let duration_ms = 15_000.min(end_ms);
+        if duration_ms == 0 {
+            return None;
+        }
+        let max_start = end_ms.saturating_sub(duration_ms);
+        let eligible = self
+            .lyric_lines
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                !line.text.trim().is_empty() && !self.excluded_line_indices().contains(index)
+            })
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return None;
+        }
+        let (_, line) = eligible.get(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos() as usize)
+                % eligible.len(),
+        )?;
+        let start = line.start_ms.saturating_sub(3_000).min(max_start);
+        Some((start, start.saturating_add(duration_ms)))
+    }
+
+    fn start_sample_render(&mut self) {
+        let Some(sample) = self.random_sample_range() else {
+            self.status = "没有可用于采样的歌词".to_owned();
+            return;
+        };
+        self.start_render_with_range(Some(sample));
     }
 
     fn start_render(&mut self) {
-        let (Some(audio), Some(output)) = (self.audio.clone(), self.output.clone()) else {
+        self.start_render_with_range(None);
+    }
+
+    fn start_render_with_range(&mut self, sample: Option<(u64, u64)>) {
+        if self.render_child.is_some() || self.internal_render.is_some() {
+            return;
+        }
+        self.render_sample = sample.is_some();
+        #[cfg(target_os = "windows")]
+        self.start_external_render(sample);
+        #[cfg(not(target_os = "windows"))]
+        self.start_internal_render(sample);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn start_external_render(&mut self, sample: Option<(u64, u64)>) {
+        let Some(audio) = self.audio.clone() else {
             self.status = "请先选择音频和输出".to_owned();
+            return;
+        };
+        let Some(output) = self.render_output_path(sample) else {
+            self.status = "无法生成渲染输出路径".to_owned();
             return;
         };
         let lyrics = self
@@ -970,8 +1141,20 @@ impl GoosyApp {
             .arg(&preview_directory)
             .arg("--preview-interval")
             .arg(self.preview_interval.to_string())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some((start_ms, end_ms)) = sample {
+            command
+                .arg("--sample-start-ms")
+                .arg(start_ms.to_string())
+                .arg("--sample-duration-ms")
+                .arg(end_ms.saturating_sub(start_ms).to_string())
+                .arg("--no-audio");
+        }
+        if self.debug_overlays {
+            command.arg("--debug-overlays");
+        }
         if self.no_audio {
             command.arg("--no-audio");
         }
@@ -1014,6 +1197,8 @@ impl GoosyApp {
                     });
                 }
                 self.render_child = Some(child);
+                self.render_lifecycle = RenderLifecycle::Running;
+                self.internal_render = None;
                 self.progress_receiver = Some(progress_receiver);
                 self.log_receiver = Some(log_receiver);
                 self.preview_directory = Some(preview_directory);
@@ -1033,6 +1218,133 @@ impl GoosyApp {
                 self.status = message;
             }
         }
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn start_internal_render(&mut self, sample: Option<(u64, u64)>) {
+        let (Some(audio), Some(output)) = (self.audio.clone(), self.render_output_path(sample))
+        else {
+            self.status = "请先选择音频和输出".to_owned();
+            return;
+        };
+        let lyrics = self
+            .selected_lyrics
+            .and_then(|index| self.lyrics_candidates.get(index).cloned());
+        let cover = self
+            .selected_cover
+            .and_then(|index| self.cover_candidates.get(index).cloned());
+        self.cleanup_preview_directory();
+        let preview_directory = new_preview_directory();
+        if let Err(error) = std::fs::create_dir_all(&preview_directory) {
+            self.status = format!("创建实时预览目录失败：{error}");
+            return;
+        }
+        let thread_preview_directory = preview_directory.clone();
+        let options = RenderOptions {
+            song: audio,
+            lyrics,
+            output,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            background: None,
+            cover,
+            title: (!self.title.trim().is_empty()).then(|| self.title.trim().to_owned()),
+            no_embedded_cover: !self.use_embedded_cover,
+            no_audio: self.no_audio || sample.is_some(),
+            render_translation: self.render_translation,
+            lyrics_style: self.current_lyrics_style(),
+            render_background_vocal: self.render_background_vocal,
+            excluded_lines: self.excluded_line_indices(),
+            format: LyricFormat::Auto,
+            sample_start_ms: sample.map(|(start, _)| start),
+            sample_duration_ms: sample.map(|(start, end)| end.saturating_sub(start)),
+        };
+        let preview_interval = self.preview_interval;
+        let width = self.width;
+        let height = self.height;
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (log_sender, log_receiver) = mpsc::channel();
+        let (control_sender, control_receiver) = mpsc::channel::<String>();
+        let (done_sender, done_receiver) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let mut preview_dir = Some(thread_preview_directory);
+            let mut preview_pixels = Vec::new();
+            let mut paused = false;
+            let result = libgoosy::render_with_frame_progress_control(
+                &options,
+                |done, total, elapsed, pixels| {
+                    let _ =
+                        progress_sender.send(format!("GOOSY_PROGRESS {done} {total} {elapsed:.3}"));
+                    let preview_due = done == 1 || done == total || done % preview_interval == 0;
+                    if preview_due {
+                        if let Some(directory) = preview_dir.as_deref() {
+                            match write_internal_preview_frame(
+                                directory,
+                                done,
+                                pixels,
+                                width,
+                                height,
+                                &mut preview_pixels,
+                            ) {
+                                Ok((preview_width, preview_height)) => {
+                                    let _ = progress_sender.send(format!(
+                                        "GOOSY_PREVIEW {done} {preview_width} {preview_height}"
+                                    ));
+                                }
+                                Err(error) => {
+                                    let _ = log_sender
+                                        .send(format!("写入实时预览失败，已停用预览：{error}"));
+                                    preview_dir = None;
+                                }
+                            }
+                        }
+                    }
+                },
+                || loop {
+                    if paused {
+                        match control_receiver.recv() {
+                            Ok(command) if command == "resume" => paused = false,
+                            Ok(command) if command == "stop" => return RenderControl::Stop,
+                            Ok(_) => {}
+                            Err(_) => return RenderControl::Stop,
+                        }
+                    } else {
+                        match control_receiver.try_recv() {
+                            Ok(command) if command == "pause" => paused = true,
+                            Ok(command) if command == "stop" => return RenderControl::Stop,
+                            Ok(_) | Err(mpsc::TryRecvError::Empty) => {
+                                return RenderControl::Continue;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => return RenderControl::Stop,
+                        }
+                    }
+                },
+            );
+            let _ = done_sender.send(result);
+        });
+        self.internal_render = Some(InternalRenderTask {
+            control: control_sender,
+            done: done_receiver,
+            thread: Some(thread),
+        });
+        self.render_child = None;
+        self.progress_receiver = Some(progress_receiver);
+        self.log_receiver = Some(log_receiver);
+        self.preview_directory = Some(preview_directory);
+        self.preview_texture = None;
+        self.preview_frame = 0;
+        self.progress = 0.0;
+        self.speed_history.clear();
+        self.current_speed = 0.0;
+        self.last_progress_sample = None;
+        self.render_lifecycle = RenderLifecycle::Running;
+        self.render_stage = "单进程渲染中".to_owned();
+        self.render_log.clear();
+        self.status = if sample.is_some() {
+            "随机 15 秒采样渲染已启动".to_owned()
+        } else {
+            "单进程渲染已启动，等待首帧…".to_owned()
+        };
     }
 
     fn poll_render(&mut self, context: &egui::Context) {
@@ -1124,9 +1436,13 @@ impl GoosyApp {
                 self.cleanup_preview_directory();
                 self.progress = if status.success() { 1.0 } else { self.progress };
                 if status.success() {
+                    self.render_lifecycle = RenderLifecycle::Idle;
                     self.status = "渲染完成".to_owned();
-                } else if self.render_log.is_empty() {
-                    self.status = format!("渲染失败：{status}");
+                } else if self.render_lifecycle != RenderLifecycle::EmergencyStopped {
+                    self.render_lifecycle = RenderLifecycle::Idle;
+                    if self.render_log.is_empty() {
+                        self.status = format!("渲染失败：{status}");
+                    }
                 }
             }
             Some(Ok(None)) => context.request_repaint_after(Duration::from_millis(100)),
@@ -1139,6 +1455,40 @@ impl GoosyApp {
                 self.status = message;
             }
             None => {}
+        }
+        let internal_result = self
+            .internal_render
+            .as_ref()
+            .and_then(|task| task.done.try_recv().ok());
+        if let Some(result) = internal_result {
+            if let Some(mut task) = self.internal_render.take() {
+                if let Some(thread) = task.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+            self.progress_receiver = None;
+            self.log_receiver = None;
+            self.cleanup_preview_directory();
+            match result {
+                Ok(()) if self.render_lifecycle == RenderLifecycle::EmergencyStopped => {}
+                Ok(()) => {
+                    self.progress = 1.0;
+                    self.render_lifecycle = RenderLifecycle::Idle;
+                    self.status = if self.render_sample {
+                        "随机 15 秒采样渲染完成".to_owned()
+                    } else {
+                        "渲染完成".to_owned()
+                    };
+                }
+                Err(error) if self.render_lifecycle == RenderLifecycle::EmergencyStopped => {}
+                Err(error) => {
+                    self.render_lifecycle = RenderLifecycle::Idle;
+                    self.status = format!("渲染失败：{error}");
+                }
+            }
+        }
+        if self.internal_render.is_some() {
+            context.request_repaint_after(Duration::from_millis(100));
         }
     }
     fn draw_speed_graph(&self, ui: &mut egui::Ui) {
@@ -1355,6 +1705,7 @@ impl GoosyApp {
                         &mut self.horizontal_padding_percent,
                         0..=200,
                     );
+                    ui.checkbox(&mut self.debug_overlays, "调试框（容器/字形/行距）");
                 });
             ui.horizontal(|ui| {
                 ui.label("预览间隔");
@@ -1373,15 +1724,43 @@ impl GoosyApp {
 
     fn draw_render_monitor(&mut self, ui: &mut egui::Ui) {
         ui.heading("渲染状态");
-        let running = self.render_child.is_some();
-        ui.horizontal(|ui| {
+        let active = self.render_child.is_some() || self.internal_render.is_some();
+        let paused = self.render_lifecycle == RenderLifecycle::Paused;
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!running, egui::Button::new("开始渲染"))
+                .add_enabled(!active, egui::Button::new("开始渲染"))
                 .clicked()
             {
                 self.start_render();
             }
-            if running
+            if ui
+                .add_enabled(
+                    !active && !self.lyric_lines.is_empty(),
+                    egui::Button::new("随机采样 15 秒"),
+                )
+                .clicked()
+            {
+                self.start_sample_render();
+            }
+            if active
+                && ui
+                    .add_enabled(
+                        true,
+                        egui::Button::new(if paused {
+                            "继续渲染"
+                        } else {
+                            "暂停渲染"
+                        }),
+                    )
+                    .clicked()
+            {
+                if paused {
+                    self.resume_render();
+                } else {
+                    self.pause_render();
+                }
+            }
+            if active
                 && ui
                     .add(
                         egui::Button::new(
@@ -1395,11 +1774,11 @@ impl GoosyApp {
             {
                 self.stop_render();
             }
-            if self.render_child.is_some() {
+            if active {
                 ui.spinner();
             }
         });
-        if self.render_child.is_some() {
+        if active || self.progress > 0.0 {
             ui.add(egui::ProgressBar::new(self.progress).show_percentage());
         }
         if let Some(texture) = &self.preview_texture {
@@ -1426,7 +1805,7 @@ impl GoosyApp {
             ui.weak("拖动左侧歌词样式参数，预览会立即更新。");
         } else if let Some(error) = &self.style_preview_error {
             ui.colored_label(egui::Color32::LIGHT_RED, format!("样式预览失败：{error}"));
-        } else if !running {
+        } else if !active {
             ui.weak("正在生成样式预览…");
         }
         if !self.speed_history.is_empty() {
@@ -1479,6 +1858,12 @@ impl GoosyApp {
 impl Drop for GoosyApp {
     fn drop(&mut self) {
         let _ = terminate_render_child(&mut self.render_child);
+        if let Some(mut task) = self.internal_render.take() {
+            let _ = task.control.send("stop".to_owned());
+            if let Some(thread) = task.thread.take() {
+                let _ = thread.join();
+            }
+        }
         self.cleanup_preview_directory();
     }
 }
@@ -1620,7 +2005,7 @@ mod tests {
         }
     }
 
-    fn preview_key(style: [u32; 6], scene: StylePreviewScene) -> StylePreviewKey {
+    fn preview_key(style: [u32; 7], scene: StylePreviewScene) -> StylePreviewKey {
         StylePreviewKey { style, scene }
     }
 
@@ -1673,6 +2058,28 @@ mod tests {
         assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 0 360"), None);
         assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 640"), None);
         assert_eq!(parse_preview_event("GOOSY_PROGRESS 45 300 1.0"), None);
+    }
+
+    #[test]
+    fn random_sample_selects_a_bounded_lyrics_window() {
+        let mut app = GoosyApp::default();
+        app.lyric_lines = vec![line("first"), line("second")];
+        app.lyric_lines[0].start_ms = 20_000;
+        app.lyric_lines[0].end_ms = 21_000;
+        app.lyric_lines[1].start_ms = 40_000;
+        app.lyric_lines[1].end_ms = 41_000;
+
+        let (start, end) = app.random_sample_range().unwrap();
+        assert_eq!(end - start, 15_000);
+        assert!(start <= 27_000);
+        assert!(end <= 42_000);
+    }
+
+    #[test]
+    fn random_sample_returns_none_without_nonempty_lyrics() {
+        let mut app = GoosyApp::default();
+        app.lyric_lines = vec![line("   ")];
+        assert_eq!(app.random_sample_range(), None);
     }
 
     #[test]
@@ -1800,13 +2207,12 @@ mod tests {
                 .any(|(left, right)| left != right)
         );
     }
-
     #[test]
     fn style_preview_worker_converges_to_the_latest_request() {
         let (sender, receiver) = spawn_style_preview_worker();
         let context = eframe::egui::Context::default();
-        let first_key = preview_key([100; 6], preview_scene(1_920, 1_080));
-        let final_key = preview_key([120, 140, 180, 50, 160, 130], preview_scene(1_280, 720));
+        let first_key = preview_key([100; 7], preview_scene(1_920, 1_080));
+        let final_key = preview_key([120, 140, 180, 50, 160, 130, 0], preview_scene(1_280, 720));
         sender
             .send(StylePreviewRequest {
                 key: first_key,
@@ -1824,6 +2230,7 @@ mod tests {
                     translation_gap_scale: 0.5,
                     background_gap_scale: 1.6,
                     horizontal_padding_scale: 1.3,
+                    debug_overlays: false,
                 },
                 context,
             })
