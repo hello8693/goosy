@@ -17,4 +17,5 @@
 **/*.pdf
 **/*.zip
 testdata/
+testdata/*
 dist/
