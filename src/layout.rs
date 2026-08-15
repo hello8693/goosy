@@ -45,7 +45,9 @@ pub struct Layout {
     focus_idx: usize,
     height: f64,
     initialized: bool,
+    // Total height occupied by each lyric group, including its text.
     group_heights: Vec<f64>,
+    // Additional empty space between adjacent groups; excludes group_heights.
     group_gap: f64,
     interlude_slot_height: f64,
     interlude: Option<Interlude>,

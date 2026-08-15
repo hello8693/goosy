@@ -317,10 +317,9 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_lyrics_style_scales() {
-        let error = request_options(
-            r#"{"song":"song.wav","output":"out.mp4","line_height_scale":0.5}"#,
-        )
-        .unwrap_err();
+        let error =
+            request_options(r#"{"song":"song.wav","output":"out.mp4","line_height_scale":0.5}"#)
+                .unwrap_err();
 
         assert!(error.contains("line_height_scale"));
     }

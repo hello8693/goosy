@@ -1,5 +1,8 @@
 use eframe::egui;
-use libgoosy::{LyricFormat, lrc, video};
+use libgoosy::{
+    LyricFormat, LyricsStyle, background, cover_renderer, geometry::FrameGeometry, layout::Layout,
+    lrc, lyrics_renderer::LyricsRenderer, video,
+};
 use rfd::FileDialog;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -28,6 +31,234 @@ fn style_percent_slider(
         ui.label(label);
         ui.add(egui::Slider::new(value, range).suffix("%").show_value(true));
     });
+}
+
+const STYLE_PREVIEW_MAX_WIDTH: u32 = 640;
+const STYLE_PREVIEW_MAX_HEIGHT: u32 = 360;
+const STYLE_PREVIEW_TIME_MS: u64 = 2_500;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StylePreviewScene {
+    width: u32,
+    height: u32,
+    title: String,
+    cover_path: Option<PathBuf>,
+    embedded_cover_audio: Option<PathBuf>,
+    render_translation: bool,
+    render_background_vocal: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StylePreviewKey {
+    style: [u32; 6],
+    scene: StylePreviewScene,
+}
+
+fn style_preview_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let scale = (STYLE_PREVIEW_MAX_WIDTH as f64 / width.max(1) as f64)
+        .min(STYLE_PREVIEW_MAX_HEIGHT as f64 / height.max(1) as f64)
+        .min(1.0);
+    (
+        (width as f64 * scale).round().max(1.0) as u32,
+        (height as f64 * scale).round().max(1.0) as u32,
+    )
+}
+
+fn style_preview_lines() -> Vec<lrc::LyricLine> {
+    vec![
+        lrc::LyricLine {
+            start_ms: 0,
+            end_ms: 1_500,
+            text: "上一行歌词 · Previous line".to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        },
+        lrc::LyricLine {
+            start_ms: 1_500,
+            end_ms: 4_500,
+            text: "正在演唱的歌词，用于预览换行与行高".to_owned(),
+            translation: Some("Live style preview for spacing and line height".to_owned()),
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: Some(lrc::BackgroundVocal {
+                start_ms: 2_000,
+                end_ms: 3_500,
+                text: "伴唱歌词 · Background vocal".to_owned(),
+                translation: None,
+                words: vec![lrc::LyricWord {
+                    start_ms: 2_000,
+                    end_ms: 3_500,
+                    text: "伴唱歌词 · Background vocal".to_owned(),
+                }],
+            }),
+            words: Vec::new(),
+        },
+        lrc::LyricLine {
+            start_ms: 4_500,
+            end_ms: 6_500,
+            text: "下一行歌词 · Next line".to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        },
+    ]
+}
+
+fn load_style_preview_cover(scene: &StylePreviewScene) -> Result<Option<Vec<u8>>, String> {
+    if let Some(path) = scene.cover_path.as_deref() {
+        return std::fs::read(path)
+            .map(Some)
+            .map_err(|error| format!("读取预览封面 {} 失败：{error}", path.display()));
+    }
+    let Some(audio) = scene.embedded_cover_audio.as_deref() else {
+        return Ok(None);
+    };
+    video::embedded_cover_image(audio).map_err(|error| error.to_string())
+}
+
+fn render_style_preview(
+    style: LyricsStyle,
+    scene: &StylePreviewScene,
+    cover_bytes: Option<&[u8]>,
+) -> Result<egui::ColorImage, String> {
+    use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
+
+    let output_width = scene.width.max(1);
+    let output_height = scene.height.max(1);
+    let preview_dimensions = style_preview_dimensions(output_width, output_height);
+    let preview_size = (preview_dimensions.0 as i32, preview_dimensions.1 as i32);
+    let geometry = FrameGeometry::for_frame(output_width, output_height);
+    let lines = style_preview_lines();
+    let renderer = LyricsRenderer::new_with_options(
+        &lines,
+        geometry.lyrics,
+        scene.render_translation,
+        scene.render_background_vocal,
+        style,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut layout = Layout::new(
+        &lines,
+        geometry.lyrics.height,
+        renderer.group_heights(),
+        renderer.group_gap(),
+        renderer.interlude_slot_height(),
+    );
+    layout.update(&lines, STYLE_PREVIEW_TIME_MS, 30);
+    let mut background = if let Some(bytes) = cover_bytes {
+        background::BackgroundRenderer::from_image_bytes(bytes)
+            .map_err(|error| error.to_string())?
+    } else {
+        background::BackgroundRenderer::dynamic()
+    };
+    let mut cover = cover_bytes
+        .map(|bytes| cover_renderer::CoverRenderer::from_bytes(bytes, Some(scene.title.clone())))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+
+    let mut surface = surfaces::raster_n32_premul(preview_size)
+        .ok_or_else(|| "无法创建样式预览画布".to_owned())?;
+    let canvas = surface.canvas();
+    canvas.clear(skia_safe::Color::BLACK);
+    let saved = canvas.save();
+    canvas.scale((
+        preview_dimensions.0 as f32 / output_width as f32,
+        preview_dimensions.1 as f32 / output_height as f32,
+    ));
+    background
+        .draw(canvas, &geometry, STYLE_PREVIEW_TIME_MS)
+        .map_err(|error| error.to_string())?;
+    if let Some(cover) = &mut cover {
+        cover
+            .draw(canvas, &geometry)
+            .map_err(|error| error.to_string())?;
+    }
+    renderer
+        .draw(
+            canvas,
+            &lines,
+            &layout,
+            STYLE_PREVIEW_TIME_MS,
+            geometry.lyrics.height as u32,
+        )
+        .map_err(|error| error.to_string())?;
+    canvas.restore_to_count(saved);
+
+    let info = ImageInfo::new(preview_size, ColorType::RGBA8888, AlphaType::Premul, None);
+    let row_bytes = preview_dimensions.0 as usize * 4;
+    let mut pixels = vec![0; info.compute_byte_size(row_bytes)];
+    if !surface.read_pixels(&info, &mut pixels, row_bytes, IPoint::new(0, 0)) {
+        return Err("读取样式预览像素失败".to_owned());
+    }
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [preview_dimensions.0 as usize, preview_dimensions.1 as usize],
+        &pixels,
+    ))
+}
+
+struct StylePreviewRequest {
+    key: StylePreviewKey,
+    style: LyricsStyle,
+    context: egui::Context,
+}
+
+struct StylePreviewOutput {
+    key: StylePreviewKey,
+    image: Result<egui::ColorImage, String>,
+}
+
+fn spawn_style_preview_worker() -> (
+    mpsc::Sender<StylePreviewRequest>,
+    mpsc::Receiver<StylePreviewOutput>,
+) {
+    let (request_sender, request_receiver) = mpsc::channel::<StylePreviewRequest>();
+    let (output_sender, output_receiver) = mpsc::channel::<StylePreviewOutput>();
+    thread::spawn(move || {
+        let mut cached_cover: Option<(
+            (Option<PathBuf>, Option<PathBuf>),
+            Result<Option<Vec<u8>>, String>,
+        )> = None;
+        while let Ok(mut request) = request_receiver.recv() {
+            while let Ok(newer) = request_receiver.try_recv() {
+                request = newer;
+            }
+            let source = (
+                request.key.scene.cover_path.clone(),
+                request.key.scene.embedded_cover_audio.clone(),
+            );
+            if cached_cover.as_ref().map(|cached| &cached.0) != Some(&source) {
+                cached_cover = Some((source, load_style_preview_cover(&request.key.scene)));
+            }
+            let image = match cached_cover
+                .as_ref()
+                .expect("preview cover cache")
+                .1
+                .as_ref()
+            {
+                Ok(cover) => {
+                    render_style_preview(request.style, &request.key.scene, cover.as_deref())
+                }
+                Err(error) => Err(error.clone()),
+            };
+            let key = request.key;
+            if output_sender
+                .send(StylePreviewOutput { key, image })
+                .is_err()
+            {
+                return;
+            }
+            request.context.request_repaint();
+        }
+    });
+    (request_sender, output_receiver)
 }
 
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/fonts/NotoSansCJKsc-Regular.otf");
@@ -146,6 +377,11 @@ struct GoosyApp {
     speed_history: VecDeque<(f32, f32)>,
     current_speed: f32,
     last_progress_sample: Option<(f32, f32)>,
+    style_preview_key: Option<StylePreviewKey>,
+    style_preview_texture: Option<egui::TextureHandle>,
+    style_preview_error: Option<String>,
+    style_preview_sender: mpsc::Sender<StylePreviewRequest>,
+    style_preview_receiver: mpsc::Receiver<StylePreviewOutput>,
     render_stage: String,
     render_log: String,
     status: String,
@@ -161,6 +397,7 @@ struct GoosyApp {
 
 impl Default for GoosyApp {
     fn default() -> Self {
+        let (style_preview_sender, style_preview_receiver) = spawn_style_preview_worker();
         Self {
             audio: None,
             lyrics_candidates: Vec::new(),
@@ -196,8 +433,13 @@ impl Default for GoosyApp {
             status: String::new(),
             page: AppPage::Render,
             render_translation: true,
+            style_preview_key: None,
+            style_preview_texture: None,
+            style_preview_error: None,
             render_background_vocal: true,
             speed_printer: false,
+            style_preview_sender,
+            style_preview_receiver,
             auto_exclude_credits: false,
             lyric_lines: Vec::new(),
             manual_excluded_lines: Vec::new(),
@@ -510,6 +752,88 @@ impl GoosyApp {
             .cover_candidates
             .iter()
             .position(|candidate| candidate == &path);
+    }
+
+    fn current_lyrics_style(&self) -> LyricsStyle {
+        LyricsStyle {
+            font_scale: self.font_scale_percent as f32 / 100.0,
+            line_height_scale: self.line_height_percent as f32 / 100.0,
+            group_gap_scale: self.line_spacing_percent as f32 / 100.0,
+            translation_gap_scale: self.translation_gap_percent as f32 / 100.0,
+            background_gap_scale: self.background_gap_percent as f32 / 100.0,
+            horizontal_padding_scale: self.horizontal_padding_percent as f32 / 100.0,
+        }
+    }
+
+    fn refresh_style_preview(&mut self, context: &egui::Context) {
+        let style_key = [
+            self.font_scale_percent,
+            self.line_height_percent,
+            self.line_spacing_percent,
+            self.translation_gap_percent,
+            self.background_gap_percent,
+            self.horizontal_padding_percent,
+        ];
+        let cover_path = self
+            .selected_cover
+            .and_then(|index| self.cover_candidates.get(index).cloned());
+        let embedded_cover_audio = if cover_path.is_none() && self.use_embedded_cover {
+            self.audio.clone()
+        } else {
+            None
+        };
+        let key = StylePreviewKey {
+            style: style_key,
+            scene: StylePreviewScene {
+                width: self.width,
+                height: self.height,
+                title: self.title.clone(),
+                cover_path,
+                embedded_cover_audio,
+                render_translation: self.render_translation,
+                render_background_vocal: self.render_background_vocal,
+            },
+        };
+        if self.style_preview_key.as_ref() != Some(&key) {
+            self.style_preview_key = Some(key.clone());
+            self.style_preview_error = None;
+            if self
+                .style_preview_sender
+                .send(StylePreviewRequest {
+                    key,
+                    style: self.current_lyrics_style(),
+                    context: context.clone(),
+                })
+                .is_err()
+            {
+                self.style_preview_error = Some("样式预览工作线程已经停止".to_owned());
+            }
+        }
+
+        let mut latest = None;
+        for output in self.style_preview_receiver.try_iter() {
+            if self.style_preview_key.as_ref() == Some(&output.key) {
+                latest = Some(output.image);
+            }
+        }
+        match latest {
+            Some(Ok(image)) => {
+                if let Some(texture) = &mut self.style_preview_texture {
+                    texture.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.style_preview_texture = Some(context.load_texture(
+                        "goosy-style-preview",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                self.style_preview_error = None;
+            }
+            Some(Err(error)) => {
+                self.style_preview_error = Some(error);
+            }
+            None => {}
+        }
     }
 
     fn cleanup_preview_directory(&mut self) {
@@ -1087,8 +1411,23 @@ impl GoosyApp {
                     .max_height(260.0)
                     .maintain_aspect_ratio(true),
             );
+        } else if let Some(texture) = &self.style_preview_texture {
+            ui.add_space(4.0);
+            ui.label(format!(
+                "参数即时预览 · {}×{} 等比",
+                self.width, self.height
+            ));
+            ui.add(
+                egui::Image::new(texture)
+                    .max_width(ui.available_width())
+                    .max_height(260.0)
+                    .maintain_aspect_ratio(true),
+            );
+            ui.weak("拖动左侧歌词样式参数，预览会立即更新。");
+        } else if let Some(error) = &self.style_preview_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, format!("样式预览失败：{error}"));
         } else if !running {
-            ui.weak("开始渲染后将在这里显示实时画面。");
+            ui.weak("正在生成样式预览…");
         }
         if !self.speed_history.is_empty() {
             self.draw_speed_graph(ui);
@@ -1105,6 +1444,7 @@ impl GoosyApp {
     }
 
     fn draw_render_page(&mut self, ui: &mut egui::Ui) {
+        self.refresh_style_preview(ui.ctx());
         if render_page_uses_columns(ui.available_width()) {
             ui.columns(2, |columns| {
                 let (left, right) = columns.split_at_mut(1);
@@ -1246,10 +1586,12 @@ fn detect_credit_lines(lines: &[lrc::LyricLine]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COVER_EXTENSIONS, GoosyApp, LYRIC_EXTENSIONS, PreviewEvent, detect_credit_lines,
-        has_extension, new_preview_directory, parse_preview_event, render_page_uses_columns,
-        terminate_render_child,
+        COVER_EXTENSIONS, GoosyApp, LYRIC_EXTENSIONS, PreviewEvent, StylePreviewKey,
+        StylePreviewRequest, StylePreviewScene, detect_credit_lines, has_extension,
+        new_preview_directory, parse_preview_event, render_page_uses_columns, render_style_preview,
+        spawn_style_preview_worker, style_preview_dimensions, terminate_render_child,
     };
+    use libgoosy::LyricsStyle;
     use libgoosy::lrc::LyricLine;
 
     fn line(text: &str) -> LyricLine {
@@ -1264,6 +1606,33 @@ mod tests {
             background_vocal: None,
             words: Vec::new(),
         }
+    }
+
+    fn preview_scene(width: u32, height: u32) -> StylePreviewScene {
+        StylePreviewScene {
+            width,
+            height,
+            title: "Preview title".to_owned(),
+            cover_path: None,
+            embedded_cover_audio: None,
+            render_translation: true,
+            render_background_vocal: true,
+        }
+    }
+
+    fn preview_key(style: [u32; 6], scene: StylePreviewScene) -> StylePreviewKey {
+        StylePreviewKey { style, scene }
+    }
+
+    fn test_cover_png() -> Vec<u8> {
+        use skia_safe::{EncodedImageFormat, ImageInfo, Pixmap};
+
+        let info = ImageInfo::new_n32_premul((2, 2), None);
+        let mut pixels = [
+            40, 80, 220, 255, 40, 80, 220, 255, 40, 80, 220, 255, 40, 80, 220, 255,
+        ];
+        let pixmap = Pixmap::new(&info, &mut pixels, 8).unwrap();
+        pixmap.encode(EncodedImageFormat::PNG, 100).unwrap()
     }
 
     #[test]
@@ -1390,5 +1759,127 @@ mod tests {
                 "used={used:?}, viewport={size:?}"
             );
         }
+    }
+
+    #[test]
+    fn style_preview_pixels_change_with_layout_parameters() {
+        let scene = preview_scene(1_920, 1_080);
+        let compact = render_style_preview(
+            LyricsStyle {
+                line_height_scale: 0.8,
+                group_gap_scale: 0.0,
+                translation_gap_scale: 0.0,
+                background_gap_scale: 0.0,
+                horizontal_padding_scale: 0.0,
+                ..LyricsStyle::default()
+            },
+            &scene,
+            None,
+        )
+        .unwrap();
+        let expanded = render_style_preview(
+            LyricsStyle {
+                line_height_scale: 1.8,
+                group_gap_scale: 2.0,
+                translation_gap_scale: 2.0,
+                background_gap_scale: 2.0,
+                horizontal_padding_scale: 2.0,
+                ..LyricsStyle::default()
+            },
+            &scene,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(compact.size, expanded.size);
+        assert!(
+            compact
+                .pixels
+                .iter()
+                .zip(&expanded.pixels)
+                .any(|(left, right)| left != right)
+        );
+    }
+
+    #[test]
+    fn style_preview_worker_converges_to_the_latest_request() {
+        let (sender, receiver) = spawn_style_preview_worker();
+        let context = eframe::egui::Context::default();
+        let first_key = preview_key([100; 6], preview_scene(1_920, 1_080));
+        let final_key = preview_key([120, 140, 180, 50, 160, 130], preview_scene(1_280, 720));
+        sender
+            .send(StylePreviewRequest {
+                key: first_key,
+                style: LyricsStyle::default(),
+                context: context.clone(),
+            })
+            .unwrap();
+        sender
+            .send(StylePreviewRequest {
+                key: final_key.clone(),
+                style: LyricsStyle {
+                    font_scale: 1.2,
+                    line_height_scale: 1.4,
+                    group_gap_scale: 1.8,
+                    translation_gap_scale: 0.5,
+                    background_gap_scale: 1.6,
+                    horizontal_padding_scale: 1.3,
+                },
+                context,
+            })
+            .unwrap();
+
+        loop {
+            let output = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            if output.key == final_key {
+                assert!(output.image.is_ok());
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn style_preview_uses_output_aspect_ratio_and_selected_cover() {
+        assert_eq!(style_preview_dimensions(1_080, 1_920), (203, 360));
+        let landscape = preview_scene(1_920, 1_080);
+        let without_cover = render_style_preview(LyricsStyle::default(), &landscape, None).unwrap();
+        let cover_png = test_cover_png();
+        let with_cover =
+            render_style_preview(LyricsStyle::default(), &landscape, Some(&cover_png)).unwrap();
+        let split_x = (with_cover.size[0] as f32 * 0.381_966_011_25) as usize;
+        let cover_center = split_x / 2 + with_cover.size[1] / 2 * with_cover.size[0];
+
+        assert_eq!(with_cover.size, [640, 360]);
+        assert_ne!(
+            with_cover.pixels[cover_center],
+            without_cover.pixels[cover_center]
+        );
+    }
+
+    #[test]
+    fn style_preview_font_size_is_derived_from_selected_output_resolution() {
+        let low_resolution =
+            render_style_preview(LyricsStyle::default(), &preview_scene(640, 360), None).unwrap();
+        let full_hd =
+            render_style_preview(LyricsStyle::default(), &preview_scene(1_920, 1_080), None)
+                .unwrap();
+        let bright_neutral_pixels = |image: &eframe::egui::ColorImage| {
+            image
+                .pixels
+                .iter()
+                .filter(|pixel| {
+                    let [red, green, blue, _] = pixel.to_array();
+                    red > 100
+                        && red.abs_diff(green) <= 20
+                        && red.abs_diff(blue) <= 20
+                        && green.abs_diff(blue) <= 20
+                })
+                .count()
+        };
+
+        assert_eq!(low_resolution.size, full_hd.size);
+        assert!(bright_neutral_pixels(&low_resolution) > bright_neutral_pixels(&full_hd));
     }
 }

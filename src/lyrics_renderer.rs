@@ -3,7 +3,7 @@ use skia_safe::canvas::SaveLayerRec;
 use skia_safe::image_filters;
 use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, RectHeightStyle, RectWidthStyle,
-    TextAlign, TextBox, TextStyle,
+    TextAlign, TextBox, TextHeightBehavior, TextStyle,
 };
 use skia_safe::{Canvas, Color, FontMgr, FontStyle, Paint, PathBuilder, Point, Rect};
 use std::cell::RefCell;
@@ -15,7 +15,7 @@ use crate::lrc::{LyricLine, scan_end_ms};
 const TRANSLATION_GAP_EM: f32 = 0.15;
 const BACKGROUND_GAP_EM: f32 = 0.12;
 const BACKGROUND_FONT_SCALE: f32 = 0.7;
-const GROUP_GAP_EM: f32 = 0.45;
+const DEFAULT_LINE_GAP_MULTIPLIER: f32 = std::f32::consts::SQRT_2;
 const HIGHLIGHT_FADE_MS: f32 = 140.0;
 const HORIZONTAL_PADDING_RATIO: f32 = 0.05;
 const MIN_HORIZONTAL_PADDING: f32 = 16.0;
@@ -74,6 +74,8 @@ pub struct LyricsRenderer {
     background_solid_paragraphs: Vec<Option<Paragraph>>,
     background_word_boxes: Vec<Vec<Vec<TextBox>>>,
     background_translation_paragraphs: Vec<Option<Paragraph>>,
+    // Height occupied by one lyric group, including its text containers and
+    // the gaps between main, translation, and background-vocal text.
     base_heights: Vec<f32>,
     translation_heights: Vec<f32>,
     margin_x: f32,
@@ -81,6 +83,8 @@ pub struct LyricsRenderer {
     main_font_size: f32,
     background_font_size: f32,
     group_heights: Vec<f64>,
+    // Extra empty space between adjacent lyric-group containers. This never
+    // includes any text or container height.
     group_gap: f64,
     dot_size: f32,
     dot_gap: f32,
@@ -119,19 +123,29 @@ impl LyricsRenderer {
         let translation_font_size = (main_font_size * 0.5).max(10.0);
         let background_font_size = (main_font_size * BACKGROUND_FONT_SCALE).max(10.0);
         let background_translation_font_size = (background_font_size * 0.5).max(10.0);
+        let mut probe_paragraphs = build_paragraphs(
+            lines,
+            Color::from_argb(102, 255, 255, 255),
+            text_width,
+            main_font_size,
+            main_font_size,
+        )?;
+        let main_glyph_height = measure_glyph_height(&mut probe_paragraphs, main_font_size);
+        let main_line_advance =
+            main_glyph_height * (1.0 + DEFAULT_LINE_GAP_MULTIPLIER) * style.line_height_scale;
         let base_paragraphs = build_paragraphs(
             lines,
             Color::from_argb(102, 255, 255, 255),
             text_width,
             main_font_size,
-            style.line_height_scale,
+            main_line_advance,
         )?;
         let solid_paragraphs = build_paragraphs(
             lines,
             Color::WHITE,
             text_width,
             main_font_size,
-            style.line_height_scale,
+            main_line_advance,
         )?;
         let word_boxes = build_word_geometry(lines, &base_paragraphs);
         let translation_paragraphs = if render_translation {
@@ -190,7 +204,8 @@ impl LyricsRenderer {
         } else {
             (0..lines.len()).map(|_| None).collect()
         };
-        let group_gap = main_font_size * GROUP_GAP_EM * style.group_gap_scale;
+        // This is pure empty space after a lyric container; text height is separate.
+        let group_gap = main_glyph_height * DEFAULT_LINE_GAP_MULTIPLIER * style.group_gap_scale;
         let dot_size = (main_font_size * 0.5).max(6.0);
         let dot_gap = (main_font_size * 0.25).max(2.0);
         let dot_margin = main_font_size * 0.4;
@@ -871,6 +886,26 @@ fn build_optional_word_geometry(
         })
         .collect()
 }
+fn measure_glyph_height(paragraphs: &mut [Paragraph], fallback: f32) -> f32 {
+    let mut measured = 0.0_f32;
+    let mut bounds = Vec::new();
+    for paragraph in paragraphs {
+        paragraph.visit(|_, info| {
+            let Some(info) = info else {
+                return;
+            };
+            bounds.resize(info.count(), Rect::default());
+            info.font().get_bounds(info.glyphs(), &mut bounds, None);
+            for bound in &bounds {
+                let height = bound.height();
+                if height.is_finite() && height > 0.0 {
+                    measured = measured.max(height);
+                }
+            }
+        });
+    }
+    if measured > 0.0 { measured } else { fallback }
+}
 
 fn build_optional_paragraphs(
     lines: &[Option<LyricLine>],
@@ -965,7 +1000,7 @@ fn build_paragraphs(
     color: Color,
     text_width: f32,
     font_size: f32,
-    line_height_scale: f32,
+    line_advance: f32,
 ) -> Result<Vec<Paragraph>> {
     let mut collection = FontCollection::new();
     collection.set_default_font_manager(FontMgr::new(), None);
@@ -978,6 +1013,7 @@ fn build_paragraphs(
             } else {
                 TextAlign::Left
             });
+            paragraph_style.set_text_height_behavior(TextHeightBehavior::DisableAll);
             let mut text_style = TextStyle::new();
             text_style.set_font_families(&[
                 "PingFang SC",
@@ -988,8 +1024,9 @@ fn build_paragraphs(
             text_style.set_font_size(font_size);
             text_style.set_color(color);
             text_style.set_font_style(FontStyle::bold());
-            text_style.set_height(1.3 * line_height_scale);
+            text_style.set_height(line_advance / font_size);
             text_style.set_height_override(true);
+            text_style.set_half_leading(true);
             paragraph_style.set_text_style(&text_style);
             let mut builder = ParagraphBuilder::new(&paragraph_style, collection.clone());
             builder.push_style(&text_style).add_text(&line.text);
@@ -1085,7 +1122,7 @@ mod tests {
             background_vocal: None,
             words: Vec::new(),
         }];
-        let renderer = LyricsRenderer::new(
+        let mut renderer = LyricsRenderer::new(
             &lines,
             Viewport {
                 x: 0.0,
@@ -1096,13 +1133,26 @@ mod tests {
         )
         .unwrap();
         assert!(renderer.base_paragraphs[0].line_number() > 1);
+        let glyph_height =
+            measure_glyph_height(&mut renderer.base_paragraphs, renderer.main_font_size);
+        let expected_gap = glyph_height * DEFAULT_LINE_GAP_MULTIPLIER;
+        let line_metrics = renderer.base_paragraphs[0].get_line_metrics();
+        for adjacent in line_metrics.windows(2) {
+            let baseline_advance = (adjacent[1].baseline - adjacent[0].baseline) as f32;
+            let visual_gap = baseline_advance - glyph_height;
+            assert!(
+                (visual_gap - expected_gap).abs() <= 1.0,
+                "visual_gap={visual_gap}, expected_gap={expected_gap}, glyph_height={glyph_height}"
+            );
+        }
         let translation_height = renderer.translation_paragraphs[0]
             .as_ref()
             .unwrap()
             .height();
         let required = renderer.base_paragraphs[0].height()
             + translation_height
-            + renderer.main_font_size * (TRANSLATION_GAP_EM + GROUP_GAP_EM);
+            + renderer.main_font_size * TRANSLATION_GAP_EM
+            + renderer.group_gap as f32;
         assert!((renderer.group_heights()[0] + renderer.group_gap()) as f32 >= required - 0.01);
     }
 
@@ -1363,5 +1413,85 @@ mod tests {
         assert!(wider_gaps.group_heights[0] > base.group_heights[0]);
         assert!(padded.margin_x > base.margin_x);
         assert!(padded.text_width < base.text_width);
+    }
+    #[test]
+    fn inter_group_gap_excludes_each_group_container_height() {
+        let lines = vec![
+            LyricLine {
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "第一行".to_owned(),
+                translation: None,
+                agent_id: None,
+                is_duet: false,
+                is_background: false,
+                background_vocal: None,
+                words: Vec::new(),
+            },
+            LyricLine {
+                start_ms: 2_000,
+                end_ms: 4_000,
+                text: "第二行".to_owned(),
+                translation: None,
+                agent_id: None,
+                is_duet: false,
+                is_background: false,
+                background_vocal: None,
+                words: Vec::new(),
+            },
+        ];
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let renderer = LyricsRenderer::new(&lines, viewport).unwrap();
+        let mut layout = Layout::new(
+            &lines,
+            viewport.height,
+            renderer.group_heights(),
+            renderer.group_gap(),
+            renderer.interlude_slot_height(),
+        );
+        layout.update(&lines, 0, 30);
+
+        assert!(
+            (renderer.group_heights()[0] - renderer.base_paragraphs[0].height() as f64).abs()
+                < 0.001
+        );
+        let top_gap = layout.pos_y[1].current_position() - layout.pos_y[0].current_position();
+        assert!((top_gap - (renderer.group_heights()[0] + renderer.group_gap())).abs() < 0.001);
+    }
+
+    #[test]
+    fn default_group_gap_is_sqrt_two_times_main_glyph_height() {
+        let lines = vec![LyricLine {
+            start_ms: 0,
+            end_ms: 2_000,
+            text: "主歌词 Glyph".to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }];
+        let mut renderer = LyricsRenderer::new(
+            &lines,
+            Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 600.0,
+                height: 300.0,
+            },
+        )
+        .unwrap();
+
+        let main_glyph_height =
+            measure_glyph_height(&mut renderer.base_paragraphs, renderer.main_font_size);
+        assert!(main_glyph_height > 0.0);
+        let ratio = renderer.group_gap as f32 / main_glyph_height;
+        assert!((ratio - DEFAULT_LINE_GAP_MULTIPLIER).abs() < 0.000_01);
     }
 }
