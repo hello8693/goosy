@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use skia_safe::canvas::SrcRectConstraint;
+use skia_safe::image::images;
 use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextAlign, TextStyle,
 };
 use skia_safe::{
-    BlurStyle, Canvas, Color, Data, FontMgr, FontStyle, Image, MaskFilter, Paint, PaintStyle,
-    Point, RRect, Rect,
+    BlurStyle, Canvas, Color, Data, FontMgr, FontStyle, Image, ImageInfo, MaskFilter, Paint,
+    PaintStyle, Pixmap, Point, RRect, Rect, SamplingOptions,
 };
 use std::path::Path;
 
@@ -22,6 +23,8 @@ pub struct CoverRenderer {
     shadow_paint: Paint,
     image_paint: Paint,
     border_paint: Paint,
+    scaled_image: Option<Image>,
+    scaled_side: u32,
 }
 
 impl CoverRenderer {
@@ -64,7 +67,38 @@ impl CoverRenderer {
             shadow_paint,
             image_paint,
             border_paint,
+            scaled_image: None,
+            scaled_side: 0,
         })
+    }
+    fn ensure_scaled_image(&mut self, side: f32) -> Result<()> {
+        if self.source.width() + 0.01 < self.image.width() as f32
+            || self.source.height() + 0.01 < self.image.height() as f32
+        {
+            return Ok(());
+        }
+        let side_px = side.ceil().max(1.0) as u32;
+        if self.scaled_image.is_some() && self.scaled_side == side_px {
+            return Ok(());
+        }
+        let info = ImageInfo::new_n32_premul((side_px as i32, side_px as i32), None);
+        let row_bytes = info.min_row_bytes();
+        let mut pixels = vec![0_u8; row_bytes * side_px as usize];
+        let pixmap =
+            Pixmap::new(&info, &mut pixels, row_bytes).context("create scaled cover pixmap")?;
+        if !self
+            .image
+            .scale_pixels(&pixmap, SamplingOptions::default(), None)
+        {
+            anyhow::bail!("scale cover image to {side_px}x{side_px}");
+        }
+        drop(pixmap);
+        self.scaled_image = Some(
+            images::raster_from_data(&info, Data::new_copy(&pixels), row_bytes)
+                .context("create scaled cover image")?,
+        );
+        self.scaled_side = side_px;
+        Ok(())
     }
 
     pub fn draw(&mut self, canvas: &Canvas, geometry: &FrameGeometry) -> Result<()> {
@@ -80,6 +114,7 @@ impl CoverRenderer {
             .max(16.0);
         self.ensure_title(side, font_size)?;
         self.ensure_shadow(side)?;
+        self.ensure_scaled_image(side)?;
 
         let title_height = self
             .title_paragraph
@@ -108,9 +143,15 @@ impl CoverRenderer {
         let rounded = RRect::new_rect_xy(destination, radius, radius);
         let saved = canvas.save();
         canvas.clip_rrect(rounded, None, true);
+        let image = self.scaled_image.as_ref().unwrap_or(&self.image);
+        let source = self
+            .scaled_image
+            .as_ref()
+            .map(|_| Rect::from_xywh(0.0, 0.0, side.ceil(), side.ceil()))
+            .unwrap_or(self.source);
         canvas.draw_image_rect(
-            &self.image,
-            Some((&self.source, SrcRectConstraint::Strict)),
+            image,
+            Some((&source, SrcRectConstraint::Strict)),
             &destination,
             &self.image_paint,
         );

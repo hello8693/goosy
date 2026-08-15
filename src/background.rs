@@ -9,7 +9,6 @@ use skia_safe::{
     AlphaType, Canvas, Color, ColorSpace, ColorType, Data, IPoint, ISize, Image, ImageFilter,
     ImageInfo, Paint, Point, Rect, TileMode,
 };
-
 const BACKGROUND_ZOOM: f32 = 1.45;
 const BACKGROUND_BLUR_SIGMA: f32 = 96.0;
 use std::path::Path;
