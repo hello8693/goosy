@@ -14,7 +14,6 @@ use crate::layout::Layout;
 use crate::lrc::{LyricLine, scan_end_ms};
 const TRANSLATION_GAP_EM: f32 = 0.15;
 const BACKGROUND_GAP_EM: f32 = 0.12;
-const BACKGROUND_FONT_SCALE: f32 = 0.7;
 const DEFAULT_LINE_GAP_MULTIPLIER: f32 = std::f32::consts::SQRT_2;
 const HIGHLIGHT_FADE_MS: f32 = 140.0;
 const HORIZONTAL_PADDING_RATIO: f32 = 0.05;
@@ -24,6 +23,8 @@ const INTERLUDE_DOT_BASE_SCALE: f32 = 0.7;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LyricsStyle {
     pub font_scale: f32,
+    pub translation_font_scale: f32,
+    pub background_font_scale: f32,
     pub line_height_scale: f32,
     pub group_gap_scale: f32,
     pub translation_gap_scale: f32,
@@ -36,6 +37,8 @@ impl Default for LyricsStyle {
     fn default() -> Self {
         Self {
             font_scale: 1.0,
+            translation_font_scale: 0.5,
+            background_font_scale: 0.7,
             line_height_scale: 1.0,
             group_gap_scale: 1.0,
             translation_gap_scale: 1.0,
@@ -50,8 +53,12 @@ impl LyricsStyle {
     fn validate(self) -> Result<()> {
         let valid = self.font_scale.is_finite()
             && (0.5..=2.0).contains(&self.font_scale)
+            && self.translation_font_scale.is_finite()
+            && (0.5..=2.0).contains(&self.translation_font_scale)
+            && self.background_font_scale.is_finite()
+            && (0.5..=2.0).contains(&self.background_font_scale)
             && self.line_height_scale.is_finite()
-            && (0.8..=1.8).contains(&self.line_height_scale)
+            && (0.5..=1.8).contains(&self.line_height_scale)
             && [
                 self.group_gap_scale,
                 self.translation_gap_scale,
@@ -122,9 +129,10 @@ impl LyricsRenderer {
                 .max(viewport.width * 0.025)
                 .max(12.0)
         }) * style.font_scale;
-        let translation_font_size = (main_font_size * 0.5).max(10.0);
-        let background_font_size = (main_font_size * BACKGROUND_FONT_SCALE).max(10.0);
-        let background_translation_font_size = (background_font_size * 0.5).max(10.0);
+        let translation_font_size = (main_font_size * style.translation_font_scale).max(10.0);
+        let background_font_size = (main_font_size * style.background_font_scale).max(10.0);
+        let background_translation_font_size =
+            (background_font_size * style.translation_font_scale).max(10.0);
         let mut probe_paragraphs = build_paragraphs(
             lines,
             Color::from_argb(102, 255, 255, 255),
@@ -305,7 +313,6 @@ impl LyricsRenderer {
     ) -> Result<()> {
         self.draw_interlude_dots(canvas, lines, layout, t_ms);
 
-        let active_idx = layout.active_idx();
         let focus_idx = layout.focus_idx();
         for index in 0..self.base_paragraphs.len() {
             if lines[index].text.is_empty()
@@ -322,12 +329,12 @@ impl LyricsRenderer {
                 continue;
             }
             let scale = layout.scale[index].current_position() as f32;
-            let is_active = index == active_idx;
+            let is_active = layout.is_active(index);
             let opacity = edge_opacity(top_y, height as f32, is_active);
             let activation = ((t_ms.saturating_sub(lines[index].start_ms) as f32)
                 / HIGHLIGHT_FADE_MS)
                 .clamp(0.0, 1.0);
-            let highlight_strength = if index == active_idx {
+            let highlight_strength = if is_active {
                 (1.0_f32 - ((1.0_f32 - scale) / 0.03_f32)).clamp(0.0, 1.0) * activation
             } else {
                 0.0

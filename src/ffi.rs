@@ -96,7 +96,7 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
         (
             "line_height_scale",
             &mut options.lyrics_style.line_height_scale,
-            0.8,
+            0.5,
         ),
         (
             "line_spacing_scale",
@@ -298,7 +298,7 @@ mod tests {
                 "song":"song.wav",
                 "output":"out.mp4",
                 "font_scale":1.25,
-                "line_height_scale":1.4,
+                "line_height_scale":0.5,
                 "line_spacing_scale":1.6,
                 "translation_gap_scale":0.5,
                 "background_gap_scale":1.8,
@@ -308,7 +308,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(options.lyrics_style.font_scale, 1.25);
-        assert_eq!(options.lyrics_style.line_height_scale, 1.4);
+        assert_eq!(options.lyrics_style.line_height_scale, 0.5);
         assert_eq!(options.lyrics_style.group_gap_scale, 1.6);
         assert_eq!(options.lyrics_style.translation_gap_scale, 0.5);
         assert_eq!(options.lyrics_style.background_gap_scale, 1.8);
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_lyrics_style_scales() {
         let error =
-            request_options(r#"{"song":"song.wav","output":"out.mp4","line_height_scale":0.5}"#)
+            request_options(r#"{"song":"song.wav","output":"out.mp4","line_height_scale":0.49}"#)
                 .unwrap_err();
 
         assert!(error.contains("line_height_scale"));

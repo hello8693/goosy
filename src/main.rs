@@ -76,6 +76,10 @@ enum Command {
         fps: u32,
         #[arg(long, default_value_t = 1.0)]
         font_scale: f32,
+        #[arg(long, default_value_t = 0.5)]
+        translation_font_scale: f32,
+        #[arg(long, default_value_t = 0.7)]
+        background_font_scale: f32,
         #[arg(long, default_value_t = 1.0)]
         line_height_scale: f32,
         #[arg(long, default_value_t = 1.0)]
@@ -169,6 +173,8 @@ fn main() -> Result<()> {
             height,
             fps,
             font_scale,
+            translation_font_scale,
+            background_font_scale,
             line_height_scale,
             line_spacing_scale,
             translation_gap_scale,
@@ -193,6 +199,8 @@ fn main() -> Result<()> {
             height,
             fps,
             font_scale,
+            translation_font_scale,
+            background_font_scale,
             line_height_scale,
             line_spacing_scale,
             translation_gap_scale,
@@ -261,6 +269,8 @@ fn render(
     height: u32,
     fps: u32,
     font_scale: f32,
+    translation_font_scale: f32,
+    background_font_scale: f32,
     line_height_scale: f32,
     line_spacing_scale: f32,
     translation_gap_scale: f32,
@@ -350,6 +360,8 @@ fn render(
         !no_background_vocal,
         LyricsStyle {
             font_scale,
+            translation_font_scale,
+            background_font_scale,
             line_height_scale,
             group_gap_scale: line_spacing_scale,
             translation_gap_scale,
