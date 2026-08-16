@@ -24,6 +24,12 @@ const MIN_HORIZONTAL_PADDING: f32 = 16.0;
 const INTERLUDE_DOT_BASE_SCALE: f32 = 0.7;
 const WORD_LIFT_EM: f32 = 0.06;
 const WORD_LIFT_DURATION_MS: u64 = 1_200;
+const BACKGROUND_INACTIVE_ALPHA: u8 = 64;
+// This layer is composited over the inactive 25% layer: 25% + 67% × 75% = 75%.
+const BACKGROUND_HIGHLIGHT_ALPHA: u8 = 170;
+const DEFAULT_LYRIC_BLUR_SIGMA_STEP: u32 = 6;
+const MAX_LYRIC_BLUR_SIGMA_STEP: u32 = 20;
+const LYRIC_BLUR_LEVELS: usize = 7;
 
 fn highlight_strength(line: &LyricLine, is_active: bool, scale: f32, t_ms: u64) -> f32 {
     if t_ms >= line.end_ms {
@@ -61,6 +67,17 @@ fn background_highlight_strength(
         * (1.0 - t_ms.saturating_sub(line.end_ms) as f32 / HIGHLIGHT_FADE_OUT_MS as f32)
             .clamp(0.0, 1.0)
 }
+fn lyric_blur_sigma(line_distance: usize, step: usize) -> usize {
+    line_distance.min(LYRIC_BLUR_LEVELS).saturating_mul(step)
+}
+
+fn make_blur_paint(sigma: f32) -> Result<RefCell<Paint>> {
+    let filter = image_filters::blur((sigma, sigma), None, None, None)
+        .context("create lyric blur filter")?;
+    let mut paint = Paint::default();
+    paint.set_image_filter(filter);
+    Ok(RefCell::new(paint))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LyricsStyle {
@@ -72,6 +89,7 @@ pub struct LyricsStyle {
     pub translation_gap_scale: f32,
     pub background_gap_scale: f32,
     pub horizontal_padding_scale: f32,
+    pub lyric_blur_sigma_step: u32,
     pub debug_overlays: bool,
 }
 
@@ -86,6 +104,7 @@ impl Default for LyricsStyle {
             translation_gap_scale: 1.0,
             background_gap_scale: 1.0,
             horizontal_padding_scale: 1.0,
+            lyric_blur_sigma_step: DEFAULT_LYRIC_BLUR_SIGMA_STEP,
             debug_overlays: false,
         }
     }
@@ -108,9 +127,10 @@ impl LyricsStyle {
                 self.horizontal_padding_scale,
             ]
             .into_iter()
-            .all(|scale| scale.is_finite() && (0.0..=2.0).contains(&scale));
+            .all(|scale| scale.is_finite() && (0.0..=2.0).contains(&scale))
+            && (1..=MAX_LYRIC_BLUR_SIGMA_STEP).contains(&self.lyric_blur_sigma_step);
         if !valid {
-            bail!("invalid lyrics style scale");
+            bail!("invalid lyrics style");
         }
         Ok(())
     }
@@ -140,7 +160,8 @@ pub struct LyricsRenderer {
     dot_size: f32,
     dot_gap: f32,
     dot_margin: f32,
-    lyric_blur_paints: Vec<Option<RefCell<Paint>>>,
+    lyric_blur_paints: Vec<RefCell<Paint>>,
+    background_vocal_blur_paint: RefCell<Paint>,
     dot_paint: RefCell<Paint>,
     style: LyricsStyle,
 }
@@ -232,14 +253,14 @@ impl LyricsRenderer {
         };
         let background_paragraphs = build_optional_paragraphs(
             &background_lines,
-            Color::from_argb(102, 255, 255, 255),
+            Color::from_argb(BACKGROUND_INACTIVE_ALPHA, 255, 255, 255),
             text_width,
             background_font_size,
             style.line_height_scale,
         )?;
         let background_solid_paragraphs = build_optional_paragraphs(
             &background_lines,
-            Color::WHITE,
+            Color::from_argb(BACKGROUND_HIGHLIGHT_ALPHA, 255, 255, 255),
             text_width,
             background_font_size,
             style.line_height_scale,
@@ -308,14 +329,14 @@ impl LyricsRenderer {
                     + background_translation_height) as f64
             })
             .collect();
-        let mut lyric_blur_paints = vec![None];
-        for sigma in 1..=5 {
-            let filter = image_filters::blur((sigma as f32, sigma as f32), None, None, None)
-                .context("create lyric blur filter")?;
-            let mut paint = Paint::default();
-            paint.set_image_filter(filter);
-            lyric_blur_paints.push(Some(RefCell::new(paint)));
-        }
+        let lyric_blur_paints = (1..=LYRIC_BLUR_LEVELS)
+            .map(|level| {
+                make_blur_paint(
+                    lyric_blur_sigma(level, style.lyric_blur_sigma_step as usize) as f32,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let background_vocal_blur_paint = make_blur_paint(1.0)?;
         let mut dot_paint = Paint::default();
         dot_paint.set_color(Color::WHITE);
         Ok(Self {
@@ -340,6 +361,7 @@ impl LyricsRenderer {
             dot_gap,
             dot_margin,
             lyric_blur_paints,
+            background_vocal_blur_paint,
             style,
             dot_paint: RefCell::new(dot_paint),
         })
@@ -384,12 +406,11 @@ impl LyricsRenderer {
             canvas.translate((anchor_x, top_y));
             canvas.scale((scale, scale));
             canvas.translate((-anchor_x, -top_y));
-            let blur_sigma = ((index as isize - focus_idx as isize).abs() as f32).min(5.0);
-            if blur_sigma > 0.01 {
-                let mut layer_paint = self.lyric_blur_paints[blur_sigma as usize]
-                    .as_ref()
-                    .expect("cached lyric blur paint")
-                    .borrow_mut();
+            let blur_level = (index as isize - focus_idx as isize)
+                .unsigned_abs()
+                .min(LYRIC_BLUR_LEVELS);
+            if blur_level > 0 {
+                let mut layer_paint = self.lyric_blur_paints[blur_level - 1].borrow_mut();
                 layer_paint.set_alpha_f(opacity);
                 let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
                 let layer = canvas.save_layer(&layer_rec);
@@ -606,10 +627,7 @@ impl LyricsRenderer {
         let background_highlighting = background_line.start_ms <= t_ms
             && (t_ms < background_line.end_ms || background_highlight > 0.0);
         if !background_highlighting && !group_blurred {
-            let layer_paint = self.lyric_blur_paints[1]
-                .as_ref()
-                .expect("cached background vocal blur paint")
-                .borrow();
+            let layer_paint = self.background_vocal_blur_paint.borrow();
             let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
             let layer = canvas.save_layer(&layer_rec);
             self.draw_background_line(
@@ -2102,5 +2120,18 @@ mod tests {
     #[test]
     fn debug_overlays_are_opt_in() {
         assert!(!LyricsStyle::default().debug_overlays);
+    }
+}
+
+#[cfg(test)]
+mod blur_parameter_tests {
+    use super::{LYRIC_BLUR_LEVELS, lyric_blur_sigma};
+
+    #[test]
+    fn lyric_blur_sigma_caps_at_seven_steps() {
+        assert_eq!(lyric_blur_sigma(0, 6), 0);
+        assert_eq!(lyric_blur_sigma(3, 6), 18);
+        assert_eq!(lyric_blur_sigma(7, 6), 42);
+        assert_eq!(lyric_blur_sigma(20, 6), LYRIC_BLUR_LEVELS * 6);
     }
 }

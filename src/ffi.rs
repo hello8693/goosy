@@ -127,6 +127,13 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
                 as f32;
         }
     }
+    if let Some(value) = object.get("lyric_blur_sigma_step") {
+        options.lyrics_style.lyric_blur_sigma_step = value
+            .as_u64()
+            .filter(|step| (1..=20).contains(step))
+            .ok_or_else(|| "request.lyric_blur_sigma_step must be between 1 and 20".to_owned())?
+            as u32;
+    }
     if let Some(value) = object.get("no_embedded_cover") {
         options.no_embedded_cover = value
             .as_bool()
@@ -302,7 +309,8 @@ mod tests {
                 "line_spacing_scale":1.6,
                 "translation_gap_scale":0.5,
                 "background_gap_scale":1.8,
-                "horizontal_padding_scale":1.2
+                "horizontal_padding_scale":1.2,
+                "lyric_blur_sigma_step":8
             }"#,
         )
         .unwrap();
@@ -313,6 +321,7 @@ mod tests {
         assert_eq!(options.lyrics_style.translation_gap_scale, 0.5);
         assert_eq!(options.lyrics_style.background_gap_scale, 1.8);
         assert_eq!(options.lyrics_style.horizontal_padding_scale, 1.2);
+        assert_eq!(options.lyrics_style.lyric_blur_sigma_step, 8);
     }
 
     #[test]

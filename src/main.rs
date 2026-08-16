@@ -90,6 +90,8 @@ enum Command {
         background_gap_scale: f32,
         #[arg(long, default_value_t = 1.0)]
         horizontal_padding_scale: f32,
+        #[arg(long, default_value_t = 6)]
+        lyric_blur_sigma_step: u32,
         #[arg(long, help = "draw lyric containers, glyph boxes, and gaps")]
         debug_overlays: bool,
         #[arg(long)]
@@ -180,6 +182,7 @@ fn main() -> Result<()> {
             translation_gap_scale,
             background_gap_scale,
             horizontal_padding_scale,
+            lyric_blur_sigma_step,
             debug_overlays,
             background,
             cover,
@@ -206,6 +209,7 @@ fn main() -> Result<()> {
             translation_gap_scale,
             background_gap_scale,
             horizontal_padding_scale,
+            lyric_blur_sigma_step,
             debug_overlays,
             background,
             cover,
@@ -276,6 +280,7 @@ fn render(
     translation_gap_scale: f32,
     background_gap_scale: f32,
     horizontal_padding_scale: f32,
+    lyric_blur_sigma_step: u32,
     debug_overlays: bool,
     background: Option<PathBuf>,
     cover: Option<PathBuf>,
@@ -367,6 +372,7 @@ fn render(
             translation_gap_scale,
             background_gap_scale,
             horizontal_padding_scale,
+            lyric_blur_sigma_step,
             debug_overlays,
         },
         &exclude_lines,

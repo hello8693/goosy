@@ -69,7 +69,7 @@ struct StylePreviewScene {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StylePreviewKey {
-    style: [u32; 9],
+    style: [u32; 10],
     scene: StylePreviewScene,
 }
 
@@ -413,6 +413,7 @@ struct GoosyApp {
     translation_gap_percent: u32,
     background_gap_percent: u32,
     horizontal_padding_percent: u32,
+    lyric_blur_sigma_step: u32,
     debug_overlays: bool,
     use_embedded_cover: bool,
     no_audio: bool,
@@ -470,6 +471,7 @@ impl Default for GoosyApp {
             translation_gap_percent: 100,
             background_gap_percent: 100,
             horizontal_padding_percent: 100,
+            lyric_blur_sigma_step: 6,
             debug_overlays: false,
             use_embedded_cover: true,
             no_audio: false,
@@ -823,6 +825,7 @@ impl GoosyApp {
             translation_gap_scale: self.translation_gap_percent as f32 / 100.0,
             background_gap_scale: self.background_gap_percent as f32 / 100.0,
             horizontal_padding_scale: self.horizontal_padding_percent as f32 / 100.0,
+            lyric_blur_sigma_step: self.lyric_blur_sigma_step,
             debug_overlays: self.debug_overlays,
         }
     }
@@ -837,6 +840,7 @@ impl GoosyApp {
             self.translation_gap_percent,
             self.background_gap_percent,
             self.horizontal_padding_percent,
+            self.lyric_blur_sigma_step,
             self.debug_overlays as u32,
         ];
         let cover_path = self
@@ -1152,6 +1156,8 @@ impl GoosyApp {
                 "{:.2}",
                 self.horizontal_padding_percent as f32 / 100.0
             ))
+            .arg("--lyric-blur-sigma-step")
+            .arg(self.lyric_blur_sigma_step.to_string())
             .arg("--format")
             .arg("auto")
             .arg("--progress-events")
@@ -1735,6 +1741,14 @@ impl GoosyApp {
                         &mut self.horizontal_padding_percent,
                         0..=200,
                     );
+                    ui.horizontal(|ui| {
+                        ui.label("模糊 Sigma 步长");
+                        ui.add(
+                            egui::Slider::new(&mut self.lyric_blur_sigma_step, 1..=20)
+                                .suffix(" / 行"),
+                        );
+                        ui.label(format!("最大 {}", self.lyric_blur_sigma_step * 7));
+                    });
                     ui.checkbox(&mut self.debug_overlays, "调试框（容器/字形/行距）");
                 });
             ui.horizontal(|ui| {
@@ -2035,7 +2049,7 @@ mod tests {
         }
     }
 
-    fn preview_key(style: [u32; 9], scene: StylePreviewScene) -> StylePreviewKey {
+    fn preview_key(style: [u32; 10], scene: StylePreviewScene) -> StylePreviewKey {
         StylePreviewKey { style, scene }
     }
 
@@ -2241,9 +2255,12 @@ mod tests {
     fn style_preview_worker_converges_to_the_latest_request() {
         let (sender, receiver) = spawn_style_preview_worker();
         let context = eframe::egui::Context::default();
-        let first_key = preview_key([100; 9], preview_scene(1_920, 1_080));
+        let first_key = preview_key(
+            [100, 100, 100, 100, 100, 100, 100, 100, 6, 0],
+            preview_scene(1_920, 1_080),
+        );
         let final_key = preview_key(
-            [120, 50, 70, 140, 180, 50, 160, 130, 0],
+            [120, 50, 70, 140, 180, 50, 160, 130, 6, 0],
             preview_scene(1_280, 720),
         );
         sender
@@ -2265,6 +2282,7 @@ mod tests {
                     translation_gap_scale: 0.5,
                     background_gap_scale: 1.6,
                     horizontal_padding_scale: 1.3,
+                    lyric_blur_sigma_step: 6,
                     debug_overlays: false,
                 },
                 context,

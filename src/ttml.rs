@@ -157,6 +157,39 @@ fn trim_words_to_text(mut words: Vec<LyricWord>, text: &str) -> Vec<LyricWord> {
     }
     words
 }
+fn strip_background_parentheses(text: &str) -> (&str, Option<(char, char)>) {
+    let text = text.trim();
+    for pair in [('(', ')'), ('（', '）')] {
+        if let Some(inner) = text
+            .strip_prefix(pair.0)
+            .and_then(|text| text.strip_suffix(pair.1))
+        {
+            return (inner.trim(), Some(pair));
+        }
+    }
+    (text, None)
+}
+
+fn strip_word_parentheses(words: &mut [LyricWord], pair: Option<(char, char)>) {
+    let Some((opening, closing)) = pair else {
+        return;
+    };
+    if let Some(first) = words.iter_mut().find(|word| !word.text.trim().is_empty()) {
+        first.text = first
+            .text
+            .trim_start()
+            .trim_start_matches(opening)
+            .to_owned();
+    }
+    if let Some(last) = words
+        .iter_mut()
+        .rev()
+        .find(|word| !word.text.trim().is_empty())
+    {
+        last.text = last.text.trim_end().trim_end_matches(closing).to_owned();
+    }
+}
+
 fn finalize_line(
     builder: LineBuilder,
     sidecar: &HashMap<String, SidecarEntry>,
@@ -212,12 +245,15 @@ fn finalize_line(
             .max()
             .unwrap_or(end_ms)
             .max(background_start + 1);
+        let (background_text, parentheses) = strip_background_parentheses(&background_text);
+        let mut background_words = builder.background_words;
+        strip_word_parentheses(&mut background_words, parentheses);
         Some(BackgroundVocal {
             start_ms: background_start,
             end_ms: background_end,
-            text: background_text.trim().to_owned(),
+            text: background_text.to_owned(),
             translation: builder.background_translation,
-            words: trim_words_to_text(builder.background_words, &background_text),
+            words: trim_words_to_text(background_words, background_text),
         })
     };
     Some(LyricLine {
@@ -557,7 +593,16 @@ mod tests {
         let input = r#"<tt><head><metadata><iTunesMetadata><translations><translation><text for="L1">译文 <span ttm:role="x-bg">(伴唱)</span></text></translation></translations></iTunesMetadata></metadata></head><body><p begin="1s" end="3s" itunes:key="L1">main</p></body></tt>"#;
         let lines = parse_ttml(input).unwrap();
         assert_eq!(lines[0].translation.as_deref(), Some("译文"));
-        assert_eq!(lines[0].background_vocal.as_ref().unwrap().text, "(伴唱)");
+        assert_eq!(lines[0].background_vocal.as_ref().unwrap().text, "伴唱");
+    }
+
+    #[test]
+    fn removes_full_width_parentheses_from_background_vocal() {
+        let input = r#"<tt><body><p begin="1s" end="3s">main<span ttm:role="x-bg"><span begin="1s" end="3s">（伴唱）</span></span></p></body></tt>"#;
+        let lines = parse_ttml(input).unwrap();
+        let background = lines[0].background_vocal.as_ref().unwrap();
+        assert_eq!(background.text, "伴唱");
+        assert_eq!(background.words[0].text, "伴唱");
     }
 
     #[test]
