@@ -15,10 +15,48 @@ use crate::lrc::{LyricLine, scan_end_ms};
 const TRANSLATION_GAP_EM: f32 = 0.15;
 const BACKGROUND_GAP_EM: f32 = 0.12;
 const DEFAULT_LINE_GAP_MULTIPLIER: f32 = std::f32::consts::SQRT_2;
-const HIGHLIGHT_FADE_MS: f32 = 140.0;
+const HIGHLIGHT_FADE_IN_MS: f32 = 140.0;
+const HIGHLIGHT_FADE_OUT_MS: u64 = 140;
 const HORIZONTAL_PADDING_RATIO: f32 = 0.05;
 const MIN_HORIZONTAL_PADDING: f32 = 16.0;
 const INTERLUDE_DOT_BASE_SCALE: f32 = 0.7;
+
+fn highlight_strength(line: &LyricLine, is_active: bool, scale: f32, t_ms: u64) -> f32 {
+    if t_ms >= line.end_ms {
+        let fade_end = line.end_ms.saturating_add(HIGHLIGHT_FADE_OUT_MS);
+        if t_ms >= fade_end {
+            return 0.0;
+        }
+        return (1.0 - t_ms.saturating_sub(line.end_ms) as f32 / HIGHLIGHT_FADE_OUT_MS as f32)
+            .clamp(0.0, 1.0);
+    }
+    if !is_active {
+        return 0.0;
+    }
+    let activation =
+        (t_ms.saturating_sub(line.start_ms) as f32 / HIGHLIGHT_FADE_IN_MS).clamp(0.0, 1.0);
+    (1.0_f32 - ((1.0_f32 - scale) / 0.03_f32)).clamp(0.0, 1.0) * activation
+}
+
+fn background_highlight_strength(
+    line: &LyricLine,
+    parent_highlight_strength: f32,
+    t_ms: u64,
+) -> f32 {
+    if t_ms < line.start_ms {
+        return 0.0;
+    }
+    if t_ms < line.end_ms {
+        return parent_highlight_strength;
+    }
+    let fade_end = line.end_ms.saturating_add(HIGHLIGHT_FADE_OUT_MS);
+    if t_ms >= fade_end {
+        return 0.0;
+    }
+    parent_highlight_strength
+        * (1.0 - t_ms.saturating_sub(line.end_ms) as f32 / HIGHLIGHT_FADE_OUT_MS as f32)
+            .clamp(0.0, 1.0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LyricsStyle {
@@ -331,14 +369,8 @@ impl LyricsRenderer {
             let scale = layout.scale[index].current_position() as f32;
             let is_active = layout.is_active(index);
             let opacity = edge_opacity(top_y, height as f32, is_active);
-            let activation = ((t_ms.saturating_sub(lines[index].start_ms) as f32)
-                / HIGHLIGHT_FADE_MS)
-                .clamp(0.0, 1.0);
-            let highlight_strength = if is_active {
-                (1.0_f32 - ((1.0_f32 - scale) / 0.03_f32)).clamp(0.0, 1.0) * activation
-            } else {
-                0.0
-            };
+            let highlight_strength = highlight_strength(&lines[index], is_active, scale, t_ms);
+            let render_highlight = is_active || highlight_strength > 0.0;
             let anchor_x = if lines[index].is_duet {
                 self.margin_x + self.text_width
             } else {
@@ -361,7 +393,7 @@ impl LyricsRenderer {
                     canvas,
                     lines,
                     index,
-                    is_active,
+                    render_highlight,
                     true,
                     highlight_strength,
                     t_ms,
@@ -373,7 +405,7 @@ impl LyricsRenderer {
                     canvas,
                     lines,
                     index,
-                    is_active,
+                    render_highlight,
                     false,
                     highlight_strength,
                     t_ms,
@@ -385,7 +417,7 @@ impl LyricsRenderer {
                     canvas,
                     lines,
                     index,
-                    is_active,
+                    render_highlight,
                     false,
                     highlight_strength,
                     t_ms,
@@ -565,13 +597,11 @@ impl LyricsRenderer {
             + translation_height
             + translation_gap
             + self.main_font_size * BACKGROUND_GAP_EM * self.style.background_gap_scale;
-        let background_active = background_line.start_ms <= t_ms && t_ms < background_line.end_ms;
-        let background_highlight = if background_active {
-            highlight_strength
-        } else {
-            0.0
-        };
-        if !background_active && !group_blurred {
+        let background_highlight =
+            background_highlight_strength(background_line, highlight_strength, t_ms);
+        let background_highlighting = background_line.start_ms <= t_ms
+            && (t_ms < background_line.end_ms || background_highlight > 0.0);
+        if !background_highlighting && !group_blurred {
             let layer_paint = self.lyric_blur_paints[1]
                 .as_ref()
                 .expect("cached background vocal blur paint")
@@ -593,7 +623,7 @@ impl LyricsRenderer {
                 canvas,
                 index,
                 background_line,
-                background_active,
+                background_highlighting,
                 background_highlight,
                 t_ms,
                 background_top,
@@ -1226,6 +1256,48 @@ fn edge_opacity(top_y: f32, height: f32, active: bool) -> f32 {
 mod tests {
     use super::*;
 
+    fn timed_line() -> LyricLine {
+        LyricLine {
+            start_ms: 1_000,
+            end_ms: 2_000,
+            text: "Lyric".to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn highlight_strength_fades_out_after_line_end() {
+        let line = timed_line();
+
+        assert_eq!(highlight_strength(&line, false, 1.0, 2_000), 1.0);
+        assert_eq!(highlight_strength(&line, false, 1.0, 2_070), 0.5);
+        assert_eq!(highlight_strength(&line, false, 1.0, 2_140), 0.0);
+        assert_eq!(highlight_strength(&line, false, 1.0, 1_500), 0.0);
+    }
+
+    #[test]
+    fn highlight_strength_preserves_fade_in() {
+        let line = timed_line();
+
+        assert_eq!(highlight_strength(&line, true, 1.0, 1_000), 0.0);
+        assert_eq!(highlight_strength(&line, true, 1.0, 1_070), 0.5);
+        assert_eq!(highlight_strength(&line, true, 1.0, 1_140), 1.0);
+    }
+
+    #[test]
+    fn background_highlight_fades_out_after_its_own_end() {
+        let line = timed_line();
+
+        assert_eq!(background_highlight_strength(&line, 1.0, 2_000), 1.0);
+        assert_eq!(background_highlight_strength(&line, 1.0, 2_070), 0.5);
+        assert_eq!(background_highlight_strength(&line, 1.0, 2_140), 0.0);
+        assert_eq!(background_highlight_strength(&line, 1.0, 999), 0.0);
+    }
     #[test]
     fn maps_cjk_and_emoji_to_utf16_offsets() {
         let text = "你 😀 hi";

@@ -2241,8 +2241,11 @@ mod tests {
     fn style_preview_worker_converges_to_the_latest_request() {
         let (sender, receiver) = spawn_style_preview_worker();
         let context = eframe::egui::Context::default();
-        let first_key = preview_key([100; 7], preview_scene(1_920, 1_080));
-        let final_key = preview_key([120, 140, 180, 50, 160, 130, 0], preview_scene(1_280, 720));
+        let first_key = preview_key([100; 9], preview_scene(1_920, 1_080));
+        let final_key = preview_key(
+            [120, 50, 70, 140, 180, 50, 160, 130, 0],
+            preview_scene(1_280, 720),
+        );
         sender
             .send(StylePreviewRequest {
                 key: first_key,
@@ -2255,6 +2258,8 @@ mod tests {
                 key: final_key.clone(),
                 style: LyricsStyle {
                     font_scale: 1.2,
+                    translation_font_scale: 0.5,
+                    background_font_scale: 0.7,
                     line_height_scale: 1.4,
                     group_gap_scale: 1.8,
                     translation_gap_scale: 0.5,
