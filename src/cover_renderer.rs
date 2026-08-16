@@ -45,7 +45,7 @@ impl CoverRenderer {
         let mut shadow_paint = Paint::default();
         shadow_paint
             .set_anti_alias(true)
-            .set_color(Color::from_argb(120, 0, 0, 0));
+            .set_color(Color::from_argb(80, 0, 0, 0));
         let mut image_paint = Paint::default();
         image_paint.set_anti_alias(true);
         let mut border_paint = Paint::default();
@@ -165,7 +165,7 @@ impl CoverRenderer {
     }
 
     fn ensure_shadow(&mut self, side: f32) -> Result<()> {
-        let sigma = (side * 0.028).max(4.0);
+        let sigma = (side * 0.056).max(4.0);
         if self.shadow_filter.is_some() && (self.shadow_sigma - sigma).abs() < 0.01 {
             return Ok(());
         }
