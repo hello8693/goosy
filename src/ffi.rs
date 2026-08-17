@@ -96,7 +96,7 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
         (
             "line_height_scale",
             &mut options.lyrics_style.line_height_scale,
-            0.8,
+            0.5,
         ),
         (
             "line_spacing_scale",
@@ -126,6 +126,13 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
                 .ok_or_else(|| format!("request.{key} must be between {minimum} and 2.0"))?
                 as f32;
         }
+    }
+    if let Some(value) = object.get("lyric_blur_sigma_step") {
+        options.lyrics_style.lyric_blur_sigma_step = value
+            .as_u64()
+            .filter(|step| (1..=20).contains(step))
+            .ok_or_else(|| "request.lyric_blur_sigma_step must be between 1 and 20".to_owned())?
+            as u32;
     }
     if let Some(value) = object.get("no_embedded_cover") {
         options.no_embedded_cover = value
@@ -298,27 +305,29 @@ mod tests {
                 "song":"song.wav",
                 "output":"out.mp4",
                 "font_scale":1.25,
-                "line_height_scale":1.4,
+                "line_height_scale":0.5,
                 "line_spacing_scale":1.6,
                 "translation_gap_scale":0.5,
                 "background_gap_scale":1.8,
-                "horizontal_padding_scale":1.2
+                "horizontal_padding_scale":1.2,
+                "lyric_blur_sigma_step":8
             }"#,
         )
         .unwrap();
 
         assert_eq!(options.lyrics_style.font_scale, 1.25);
-        assert_eq!(options.lyrics_style.line_height_scale, 1.4);
+        assert_eq!(options.lyrics_style.line_height_scale, 0.5);
         assert_eq!(options.lyrics_style.group_gap_scale, 1.6);
         assert_eq!(options.lyrics_style.translation_gap_scale, 0.5);
         assert_eq!(options.lyrics_style.background_gap_scale, 1.8);
         assert_eq!(options.lyrics_style.horizontal_padding_scale, 1.2);
+        assert_eq!(options.lyrics_style.lyric_blur_sigma_step, 8);
     }
 
     #[test]
     fn rejects_out_of_range_lyrics_style_scales() {
         let error =
-            request_options(r#"{"song":"song.wav","output":"out.mp4","line_height_scale":0.5}"#)
+            request_options(r#"{"song":"song.wav","output":"out.mp4","line_height_scale":0.49}"#)
                 .unwrap_err();
 
         assert!(error.contains("line_height_scale"));

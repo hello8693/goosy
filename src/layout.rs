@@ -142,6 +142,9 @@ impl Layout {
     pub fn active_idx(&self) -> usize {
         self.active_idx
     }
+    pub fn is_active(&self, index: usize) -> bool {
+        self.interlude.is_none() && index == self.active_idx
+    }
 
     pub fn focus_idx(&self) -> usize {
         self.focus_idx
@@ -357,6 +360,8 @@ mod tests {
             (layout.pos_y[1].current_position() - layout.pos_y[0].current_position() - 110.0).abs()
                 < 1e-9
         );
+        assert!(!layout.is_active(0));
+        assert!(!layout.is_active(1));
         layout.update(&lines, 5_800, 30);
         assert_eq!(layout.focus_idx, 0);
         layout.update(&lines, 5_820, 30);

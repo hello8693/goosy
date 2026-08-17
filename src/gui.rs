@@ -69,7 +69,7 @@ struct StylePreviewScene {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StylePreviewKey {
-    style: [u32; 7],
+    style: [u32; 10],
     scene: StylePreviewScene,
 }
 
@@ -406,11 +406,14 @@ struct GoosyApp {
     height: u32,
     fps: u32,
     font_scale_percent: u32,
+    translation_font_scale_percent: u32,
+    background_font_scale_percent: u32,
     line_height_percent: u32,
     line_spacing_percent: u32,
     translation_gap_percent: u32,
     background_gap_percent: u32,
     horizontal_padding_percent: u32,
+    lyric_blur_sigma_step: u32,
     debug_overlays: bool,
     use_embedded_cover: bool,
     no_audio: bool,
@@ -461,11 +464,14 @@ impl Default for GoosyApp {
             height: 1080,
             fps: 30,
             font_scale_percent: 100,
+            translation_font_scale_percent: 50,
+            background_font_scale_percent: 70,
             line_height_percent: 100,
             line_spacing_percent: 100,
             translation_gap_percent: 100,
             background_gap_percent: 100,
             horizontal_padding_percent: 100,
+            lyric_blur_sigma_step: 6,
             debug_overlays: false,
             use_embedded_cover: true,
             no_audio: false,
@@ -812,11 +818,14 @@ impl GoosyApp {
     fn current_lyrics_style(&self) -> LyricsStyle {
         LyricsStyle {
             font_scale: self.font_scale_percent as f32 / 100.0,
+            translation_font_scale: self.translation_font_scale_percent as f32 / 100.0,
+            background_font_scale: self.background_font_scale_percent as f32 / 100.0,
             line_height_scale: self.line_height_percent as f32 / 100.0,
             group_gap_scale: self.line_spacing_percent as f32 / 100.0,
             translation_gap_scale: self.translation_gap_percent as f32 / 100.0,
             background_gap_scale: self.background_gap_percent as f32 / 100.0,
             horizontal_padding_scale: self.horizontal_padding_percent as f32 / 100.0,
+            lyric_blur_sigma_step: self.lyric_blur_sigma_step,
             debug_overlays: self.debug_overlays,
         }
     }
@@ -824,11 +833,14 @@ impl GoosyApp {
     fn refresh_style_preview(&mut self, context: &egui::Context) {
         let style_key = [
             self.font_scale_percent,
+            self.translation_font_scale_percent,
+            self.background_font_scale_percent,
             self.line_height_percent,
             self.line_spacing_percent,
             self.translation_gap_percent,
             self.background_gap_percent,
             self.horizontal_padding_percent,
+            self.lyric_blur_sigma_step,
             self.debug_overlays as u32,
         ];
         let cover_path = self
@@ -1118,6 +1130,16 @@ impl GoosyApp {
             .arg(self.fps.to_string())
             .arg("--font-scale")
             .arg(format!("{:.2}", self.font_scale_percent as f32 / 100.0))
+            .arg("--translation-font-scale")
+            .arg(format!(
+                "{:.2}",
+                self.translation_font_scale_percent as f32 / 100.0
+            ))
+            .arg("--background-font-scale")
+            .arg(format!(
+                "{:.2}",
+                self.background_font_scale_percent as f32 / 100.0
+            ))
             .arg("--line-height-scale")
             .arg(format!("{:.2}", self.line_height_percent as f32 / 100.0))
             .arg("--line-spacing-scale")
@@ -1134,6 +1156,8 @@ impl GoosyApp {
                 "{:.2}",
                 self.horizontal_padding_percent as f32 / 100.0
             ))
+            .arg("--lyric-blur-sigma-step")
+            .arg(self.lyric_blur_sigma_step.to_string())
             .arg("--format")
             .arg("auto")
             .arg("--progress-events")
@@ -1690,7 +1714,19 @@ impl GoosyApp {
                 .default_open(true)
                 .show(ui, |ui| {
                     style_percent_slider(ui, "字号", &mut self.font_scale_percent, 50..=200);
-                    style_percent_slider(ui, "段内行高", &mut self.line_height_percent, 80..=180);
+                    style_percent_slider(
+                        ui,
+                        "翻译字号",
+                        &mut self.translation_font_scale_percent,
+                        50..=200,
+                    );
+                    style_percent_slider(
+                        ui,
+                        "伴唱字号",
+                        &mut self.background_font_scale_percent,
+                        50..=200,
+                    );
+                    style_percent_slider(ui, "段内行高", &mut self.line_height_percent, 50..=180);
                     style_percent_slider(ui, "歌词行间距", &mut self.line_spacing_percent, 0..=200);
                     style_percent_slider(
                         ui,
@@ -1705,6 +1741,14 @@ impl GoosyApp {
                         &mut self.horizontal_padding_percent,
                         0..=200,
                     );
+                    ui.horizontal(|ui| {
+                        ui.label("模糊 Sigma 步长");
+                        ui.add(
+                            egui::Slider::new(&mut self.lyric_blur_sigma_step, 1..=20)
+                                .suffix(" / 行"),
+                        );
+                        ui.label(format!("最大 {}", self.lyric_blur_sigma_step * 7));
+                    });
                     ui.checkbox(&mut self.debug_overlays, "调试框（容器/字形/行距）");
                 });
             ui.horizontal(|ui| {
@@ -2005,7 +2049,7 @@ mod tests {
         }
     }
 
-    fn preview_key(style: [u32; 7], scene: StylePreviewScene) -> StylePreviewKey {
+    fn preview_key(style: [u32; 10], scene: StylePreviewScene) -> StylePreviewKey {
         StylePreviewKey { style, scene }
     }
 
@@ -2173,7 +2217,7 @@ mod tests {
         let scene = preview_scene(1_920, 1_080);
         let compact = render_style_preview(
             LyricsStyle {
-                line_height_scale: 0.8,
+                line_height_scale: 0.5,
                 group_gap_scale: 0.0,
                 translation_gap_scale: 0.0,
                 background_gap_scale: 0.0,
@@ -2211,8 +2255,14 @@ mod tests {
     fn style_preview_worker_converges_to_the_latest_request() {
         let (sender, receiver) = spawn_style_preview_worker();
         let context = eframe::egui::Context::default();
-        let first_key = preview_key([100; 7], preview_scene(1_920, 1_080));
-        let final_key = preview_key([120, 140, 180, 50, 160, 130, 0], preview_scene(1_280, 720));
+        let first_key = preview_key(
+            [100, 100, 100, 100, 100, 100, 100, 100, 6, 0],
+            preview_scene(1_920, 1_080),
+        );
+        let final_key = preview_key(
+            [120, 50, 70, 140, 180, 50, 160, 130, 6, 0],
+            preview_scene(1_280, 720),
+        );
         sender
             .send(StylePreviewRequest {
                 key: first_key,
@@ -2225,11 +2275,14 @@ mod tests {
                 key: final_key.clone(),
                 style: LyricsStyle {
                     font_scale: 1.2,
+                    translation_font_scale: 0.5,
+                    background_font_scale: 0.7,
                     line_height_scale: 1.4,
                     group_gap_scale: 1.8,
                     translation_gap_scale: 0.5,
                     background_gap_scale: 1.6,
                     horizontal_padding_scale: 1.3,
+                    lyric_blur_sigma_step: 6,
                     debug_overlays: false,
                 },
                 context,

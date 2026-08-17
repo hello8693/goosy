@@ -33,6 +33,10 @@ enum Command {
         fps: u32,
         #[arg(long, default_value_t = 1.0)]
         font_scale: f32,
+        #[arg(long, default_value_t = 0.5)]
+        translation_font_scale: f32,
+        #[arg(long, default_value_t = 0.7)]
+        background_font_scale: f32,
         #[arg(long, default_value_t = 1.0)]
         line_height_scale: f32,
         #[arg(long, default_value_t = 1.0)]
@@ -43,6 +47,8 @@ enum Command {
         background_gap_scale: f32,
         #[arg(long, default_value_t = 1.0)]
         horizontal_padding_scale: f32,
+        #[arg(long, default_value_t = 6)]
+        lyric_blur_sigma_step: u32,
         #[arg(long, help = "draw lyric containers, glyph boxes, and gaps")]
         debug_overlays: bool,
         #[arg(long, hide = true)]
@@ -340,11 +346,14 @@ fn main() -> Result<()> {
             height,
             fps,
             font_scale,
+            translation_font_scale,
+            background_font_scale,
             line_height_scale,
             line_spacing_scale,
             translation_gap_scale,
             background_gap_scale,
             horizontal_padding_scale,
+            lyric_blur_sigma_step,
             debug_overlays,
             sample_start_ms,
             sample_duration_ms,
@@ -376,11 +385,14 @@ fn main() -> Result<()> {
                 fps,
                 lyrics_style: LyricsStyle {
                     font_scale,
+                    translation_font_scale,
+                    background_font_scale,
                     line_height_scale,
                     group_gap_scale: line_spacing_scale,
                     translation_gap_scale,
                     background_gap_scale,
                     horizontal_padding_scale,
+                    lyric_blur_sigma_step,
                     debug_overlays,
                 },
                 background,

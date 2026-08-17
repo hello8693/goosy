@@ -5,7 +5,9 @@ use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, RectHeightStyle, RectWidthStyle,
     TextAlign, TextBox, TextHeightBehavior, TextStyle,
 };
-use skia_safe::{Canvas, Color, FontMgr, FontStyle, Paint, PaintStyle, PathBuilder, Point, Rect};
+use skia_safe::{
+    BlendMode, Canvas, Color, FontMgr, FontStyle, Paint, PaintStyle, PathBuilder, Point, Rect,
+};
 use std::cell::RefCell;
 
 use crate::easing::bez_in;
@@ -14,21 +16,80 @@ use crate::layout::Layout;
 use crate::lrc::{LyricLine, scan_end_ms};
 const TRANSLATION_GAP_EM: f32 = 0.15;
 const BACKGROUND_GAP_EM: f32 = 0.12;
-const BACKGROUND_FONT_SCALE: f32 = 0.7;
 const DEFAULT_LINE_GAP_MULTIPLIER: f32 = std::f32::consts::SQRT_2;
-const HIGHLIGHT_FADE_MS: f32 = 140.0;
+const HIGHLIGHT_FADE_IN_MS: f32 = 140.0;
+const HIGHLIGHT_FADE_OUT_MS: u64 = 140;
 const HORIZONTAL_PADDING_RATIO: f32 = 0.05;
 const MIN_HORIZONTAL_PADDING: f32 = 16.0;
 const INTERLUDE_DOT_BASE_SCALE: f32 = 0.7;
+const WORD_LIFT_EM: f32 = 0.06;
+const WORD_LIFT_DURATION_MS: u64 = 1_200;
+const BACKGROUND_INACTIVE_ALPHA: u8 = 64;
+// This layer is composited over the inactive 25% layer: 25% + 67% × 75% = 75%.
+const BACKGROUND_HIGHLIGHT_ALPHA: u8 = 170;
+const DEFAULT_LYRIC_BLUR_SIGMA_STEP: u32 = 6;
+const MAX_LYRIC_BLUR_SIGMA_STEP: u32 = 20;
+const LYRIC_BLUR_LEVELS: usize = 7;
+
+fn highlight_strength(line: &LyricLine, is_active: bool, scale: f32, t_ms: u64) -> f32 {
+    if t_ms >= line.end_ms {
+        let fade_end = line.end_ms.saturating_add(HIGHLIGHT_FADE_OUT_MS);
+        if t_ms >= fade_end {
+            return 0.0;
+        }
+        return (1.0 - t_ms.saturating_sub(line.end_ms) as f32 / HIGHLIGHT_FADE_OUT_MS as f32)
+            .clamp(0.0, 1.0);
+    }
+    if !is_active {
+        return 0.0;
+    }
+    let activation =
+        (t_ms.saturating_sub(line.start_ms) as f32 / HIGHLIGHT_FADE_IN_MS).clamp(0.0, 1.0);
+    (1.0_f32 - ((1.0_f32 - scale) / 0.03_f32)).clamp(0.0, 1.0) * activation
+}
+
+fn background_highlight_strength(
+    line: &LyricLine,
+    parent_highlight_strength: f32,
+    t_ms: u64,
+) -> f32 {
+    if t_ms < line.start_ms {
+        return 0.0;
+    }
+    if t_ms < line.end_ms {
+        return parent_highlight_strength;
+    }
+    let fade_end = line.end_ms.saturating_add(HIGHLIGHT_FADE_OUT_MS);
+    if t_ms >= fade_end {
+        return 0.0;
+    }
+    parent_highlight_strength
+        * (1.0 - t_ms.saturating_sub(line.end_ms) as f32 / HIGHLIGHT_FADE_OUT_MS as f32)
+            .clamp(0.0, 1.0)
+}
+fn lyric_blur_sigma(line_distance: usize, step: usize) -> usize {
+    line_distance.min(LYRIC_BLUR_LEVELS).saturating_mul(step)
+}
+
+fn make_blur_paint(sigma: f32) -> Result<RefCell<Paint>> {
+    let filter = image_filters::blur((sigma, sigma), None, None, None)
+        .context("create lyric blur filter")?;
+    let mut paint = Paint::default();
+    paint.set_image_filter(filter);
+    Ok(RefCell::new(paint))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LyricsStyle {
     pub font_scale: f32,
+    pub translation_font_scale: f32,
+    pub background_font_scale: f32,
     pub line_height_scale: f32,
     pub group_gap_scale: f32,
     pub translation_gap_scale: f32,
     pub background_gap_scale: f32,
     pub horizontal_padding_scale: f32,
+    pub lyric_blur_sigma_step: u32,
     pub debug_overlays: bool,
 }
 
@@ -36,11 +97,14 @@ impl Default for LyricsStyle {
     fn default() -> Self {
         Self {
             font_scale: 1.0,
+            translation_font_scale: 0.5,
+            background_font_scale: 0.7,
             line_height_scale: 1.0,
             group_gap_scale: 1.0,
             translation_gap_scale: 1.0,
             background_gap_scale: 1.0,
             horizontal_padding_scale: 1.0,
+            lyric_blur_sigma_step: DEFAULT_LYRIC_BLUR_SIGMA_STEP,
             debug_overlays: false,
         }
     }
@@ -50,8 +114,12 @@ impl LyricsStyle {
     fn validate(self) -> Result<()> {
         let valid = self.font_scale.is_finite()
             && (0.5..=2.0).contains(&self.font_scale)
+            && self.translation_font_scale.is_finite()
+            && (0.5..=2.0).contains(&self.translation_font_scale)
+            && self.background_font_scale.is_finite()
+            && (0.5..=2.0).contains(&self.background_font_scale)
             && self.line_height_scale.is_finite()
-            && (0.8..=1.8).contains(&self.line_height_scale)
+            && (0.5..=1.8).contains(&self.line_height_scale)
             && [
                 self.group_gap_scale,
                 self.translation_gap_scale,
@@ -59,9 +127,10 @@ impl LyricsStyle {
                 self.horizontal_padding_scale,
             ]
             .into_iter()
-            .all(|scale| scale.is_finite() && (0.0..=2.0).contains(&scale));
+            .all(|scale| scale.is_finite() && (0.0..=2.0).contains(&scale))
+            && (1..=MAX_LYRIC_BLUR_SIGMA_STEP).contains(&self.lyric_blur_sigma_step);
         if !valid {
-            bail!("invalid lyrics style scale");
+            bail!("invalid lyrics style");
         }
         Ok(())
     }
@@ -91,7 +160,8 @@ pub struct LyricsRenderer {
     dot_size: f32,
     dot_gap: f32,
     dot_margin: f32,
-    lyric_blur_paints: Vec<Option<RefCell<Paint>>>,
+    lyric_blur_paints: Vec<RefCell<Paint>>,
+    background_vocal_blur_paint: RefCell<Paint>,
     dot_paint: RefCell<Paint>,
     style: LyricsStyle,
 }
@@ -122,9 +192,10 @@ impl LyricsRenderer {
                 .max(viewport.width * 0.025)
                 .max(12.0)
         }) * style.font_scale;
-        let translation_font_size = (main_font_size * 0.5).max(10.0);
-        let background_font_size = (main_font_size * BACKGROUND_FONT_SCALE).max(10.0);
-        let background_translation_font_size = (background_font_size * 0.5).max(10.0);
+        let translation_font_size = (main_font_size * style.translation_font_scale).max(10.0);
+        let background_font_size = (main_font_size * style.background_font_scale).max(10.0);
+        let background_translation_font_size =
+            (background_font_size * style.translation_font_scale).max(10.0);
         let mut probe_paragraphs = build_paragraphs(
             lines,
             Color::from_argb(102, 255, 255, 255),
@@ -182,14 +253,14 @@ impl LyricsRenderer {
         };
         let background_paragraphs = build_optional_paragraphs(
             &background_lines,
-            Color::from_argb(102, 255, 255, 255),
+            Color::from_argb(BACKGROUND_INACTIVE_ALPHA, 255, 255, 255),
             text_width,
             background_font_size,
             style.line_height_scale,
         )?;
         let background_solid_paragraphs = build_optional_paragraphs(
             &background_lines,
-            Color::WHITE,
+            Color::from_argb(BACKGROUND_HIGHLIGHT_ALPHA, 255, 255, 255),
             text_width,
             background_font_size,
             style.line_height_scale,
@@ -258,14 +329,14 @@ impl LyricsRenderer {
                     + background_translation_height) as f64
             })
             .collect();
-        let mut lyric_blur_paints = vec![None];
-        for sigma in 1..=5 {
-            let filter = image_filters::blur((sigma as f32, sigma as f32), None, None, None)
-                .context("create lyric blur filter")?;
-            let mut paint = Paint::default();
-            paint.set_image_filter(filter);
-            lyric_blur_paints.push(Some(RefCell::new(paint)));
-        }
+        let lyric_blur_paints = (1..=LYRIC_BLUR_LEVELS)
+            .map(|level| {
+                make_blur_paint(
+                    lyric_blur_sigma(level, style.lyric_blur_sigma_step as usize) as f32,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let background_vocal_blur_paint = make_blur_paint(1.0)?;
         let mut dot_paint = Paint::default();
         dot_paint.set_color(Color::WHITE);
         Ok(Self {
@@ -290,6 +361,7 @@ impl LyricsRenderer {
             dot_gap,
             dot_margin,
             lyric_blur_paints,
+            background_vocal_blur_paint,
             style,
             dot_paint: RefCell::new(dot_paint),
         })
@@ -305,7 +377,6 @@ impl LyricsRenderer {
     ) -> Result<()> {
         self.draw_interlude_dots(canvas, lines, layout, t_ms);
 
-        let active_idx = layout.active_idx();
         let focus_idx = layout.focus_idx();
         for index in 0..self.base_paragraphs.len() {
             if lines[index].text.is_empty()
@@ -322,16 +393,10 @@ impl LyricsRenderer {
                 continue;
             }
             let scale = layout.scale[index].current_position() as f32;
-            let is_active = index == active_idx;
+            let is_active = layout.is_active(index);
             let opacity = edge_opacity(top_y, height as f32, is_active);
-            let activation = ((t_ms.saturating_sub(lines[index].start_ms) as f32)
-                / HIGHLIGHT_FADE_MS)
-                .clamp(0.0, 1.0);
-            let highlight_strength = if index == active_idx {
-                (1.0_f32 - ((1.0_f32 - scale) / 0.03_f32)).clamp(0.0, 1.0) * activation
-            } else {
-                0.0
-            };
+            let highlight_strength = highlight_strength(&lines[index], is_active, scale, t_ms);
+            let render_highlight = is_active || highlight_strength > 0.0;
             let anchor_x = if lines[index].is_duet {
                 self.margin_x + self.text_width
             } else {
@@ -341,12 +406,11 @@ impl LyricsRenderer {
             canvas.translate((anchor_x, top_y));
             canvas.scale((scale, scale));
             canvas.translate((-anchor_x, -top_y));
-            let blur_sigma = ((index as isize - focus_idx as isize).abs() as f32).min(5.0);
-            if blur_sigma > 0.01 {
-                let mut layer_paint = self.lyric_blur_paints[blur_sigma as usize]
-                    .as_ref()
-                    .expect("cached lyric blur paint")
-                    .borrow_mut();
+            let blur_level = (index as isize - focus_idx as isize)
+                .unsigned_abs()
+                .min(LYRIC_BLUR_LEVELS);
+            if blur_level > 0 {
+                let mut layer_paint = self.lyric_blur_paints[blur_level - 1].borrow_mut();
                 layer_paint.set_alpha_f(opacity);
                 let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
                 let layer = canvas.save_layer(&layer_rec);
@@ -354,7 +418,7 @@ impl LyricsRenderer {
                     canvas,
                     lines,
                     index,
-                    is_active,
+                    render_highlight,
                     true,
                     highlight_strength,
                     t_ms,
@@ -366,7 +430,7 @@ impl LyricsRenderer {
                     canvas,
                     lines,
                     index,
-                    is_active,
+                    render_highlight,
                     false,
                     highlight_strength,
                     t_ms,
@@ -378,7 +442,7 @@ impl LyricsRenderer {
                     canvas,
                     lines,
                     index,
-                    is_active,
+                    render_highlight,
                     false,
                     highlight_strength,
                     t_ms,
@@ -558,17 +622,12 @@ impl LyricsRenderer {
             + translation_height
             + translation_gap
             + self.main_font_size * BACKGROUND_GAP_EM * self.style.background_gap_scale;
-        let background_active = background_line.start_ms <= t_ms && t_ms < background_line.end_ms;
-        let background_highlight = if background_active {
-            highlight_strength
-        } else {
-            0.0
-        };
-        if !background_active && !group_blurred {
-            let layer_paint = self.lyric_blur_paints[1]
-                .as_ref()
-                .expect("cached background vocal blur paint")
-                .borrow();
+        let background_highlight =
+            background_highlight_strength(background_line, highlight_strength, t_ms);
+        let background_highlighting = background_line.start_ms <= t_ms
+            && (t_ms < background_line.end_ms || background_highlight > 0.0);
+        if !background_highlighting && !group_blurred {
+            let layer_paint = self.background_vocal_blur_paint.borrow();
             let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
             let layer = canvas.save_layer(&layer_rec);
             self.draw_background_line(
@@ -586,7 +645,7 @@ impl LyricsRenderer {
                 canvas,
                 index,
                 background_line,
-                background_active,
+                background_highlighting,
                 background_highlight,
                 t_ms,
                 background_top,
@@ -767,8 +826,16 @@ fn draw_line(
         );
         return;
     }
-    paragraph.paint(canvas, position);
+    let has_timed_words = word_boxes.len() == line.words.len()
+        && !line.words.is_empty()
+        && word_boxes.iter().all(|boxes| !boxes.is_empty());
+    if !has_timed_words {
+        paragraph.paint(canvas, position);
+    }
     if highlight_strength <= 0.0 {
+        if has_timed_words {
+            paragraph.paint(canvas, position);
+        }
         draw_translation(
             canvas,
             translation,
@@ -780,11 +847,7 @@ fn draw_line(
         return;
     }
     let feather_width = (main_font_size * 0.08).clamp(2.0, 8.0);
-    let mut core_mask = PathBuilder::new();
-    let mut feather_masks = [PathBuilder::new(), PathBuilder::new(), PathBuilder::new()];
-    let mut has_core = false;
-    let mut has_feather = [false; 3];
-    if word_boxes.len() == line.words.len() && !line.words.is_empty() {
+    if has_timed_words {
         for (word, boxes) in line.words.iter().zip(word_boxes) {
             let total_width = boxes
                 .iter()
@@ -792,16 +855,34 @@ fn draw_line(
                 .sum::<f32>();
             let progress = bez_in(word_progress(word.start_ms, word.end_ms, t_ms)) as f32;
             let fill_width = total_width * progress;
+            let lift_progress = bez_in(word_lift_progress(word.start_ms, t_ms)) as f32;
+            let lift_offset = word_lift_offset(lift_progress, highlight_strength, main_font_size);
+            let word_position = Point::new(margin_x, top_y);
             let feather = if progress < 0.999 {
                 feather_width.min(fill_width)
             } else {
                 0.0
             };
             let core_end = fill_width - feather;
+            let mut core_mask = PathBuilder::new();
+            let mut feather_masks = [PathBuilder::new(), PathBuilder::new(), PathBuilder::new()];
+            let mut has_core = false;
+            let mut has_feather = [false; 3];
+            let mut word_mask = PathBuilder::new();
             let mut cursor = 0.0;
             for text_box in boxes {
                 let rect = text_box.rect;
                 let box_start = cursor;
+                word_mask.add_rect(
+                    Rect::from_xywh(
+                        rect.left() + margin_x,
+                        top_y + rect.top(),
+                        rect.width(),
+                        rect.height(),
+                    ),
+                    None,
+                    None,
+                );
                 let box_end = cursor + rect.width();
                 let core_start = box_start.max(0.0);
                 let core_stop = core_end.min(box_end);
@@ -839,6 +920,37 @@ fn draw_line(
                 }
                 cursor = box_end;
             }
+            paint_lifted_highlight_mask(
+                canvas,
+                &word_mask.detach(),
+                paragraph,
+                word_position,
+                lift_offset,
+                1.0,
+            );
+            if has_core {
+                paint_lifted_highlight_mask(
+                    canvas,
+                    &core_mask.detach(),
+                    active_paragraph,
+                    word_position,
+                    lift_offset,
+                    highlight_strength,
+                );
+            }
+            for level in 0..3 {
+                if has_feather[level] {
+                    let edge_alpha = highlight_strength * (1.0 - (level as f32 + 0.5) / 3.0);
+                    paint_lifted_highlight_mask(
+                        canvas,
+                        &feather_masks[level].detach(),
+                        active_paragraph,
+                        word_position,
+                        lift_offset,
+                        edge_alpha,
+                    );
+                }
+            }
         }
     } else {
         // Plain LRC has no word timing: scan the entire laid-out line as one unit.
@@ -852,6 +964,10 @@ fn draw_line(
             0.0
         };
         let core_end = (fill_width - feather).max(0.0);
+        let mut core_mask = PathBuilder::new();
+        let mut feather_masks = [PathBuilder::new(), PathBuilder::new(), PathBuilder::new()];
+        let mut has_core = false;
+        let mut has_feather = [false; 3];
         if core_end > 0.0 {
             core_mask.add_rect(
                 Rect::from_xywh(margin_x, top_y, core_end, paragraph.height()),
@@ -872,26 +988,26 @@ fn draw_line(
                 has_feather[level] = true;
             }
         }
-    }
-    if has_core {
-        paint_highlight_mask(
-            canvas,
-            &core_mask.detach(),
-            active_paragraph,
-            position,
-            highlight_strength,
-        );
-    }
-    for level in 0..3 {
-        if has_feather[level] {
-            let edge_alpha = highlight_strength * (1.0 - (level as f32 + 0.5) / 3.0);
+        if has_core {
             paint_highlight_mask(
                 canvas,
-                &feather_masks[level].detach(),
+                &core_mask.detach(),
                 active_paragraph,
                 position,
-                edge_alpha,
+                highlight_strength,
             );
+        }
+        for level in 0..3 {
+            if has_feather[level] {
+                let edge_alpha = highlight_strength * (1.0 - (level as f32 + 0.5) / 3.0);
+                paint_highlight_mask(
+                    canvas,
+                    &feather_masks[level].detach(),
+                    active_paragraph,
+                    position,
+                    edge_alpha,
+                );
+            }
         }
     }
     draw_translation(
@@ -900,6 +1016,65 @@ fn draw_line(
         margin_x,
         top_y + paragraph.height() + main_font_size * TRANSLATION_GAP_EM * translation_gap_scale,
     );
+}
+
+fn paint_lifted_highlight_mask(
+    canvas: &Canvas,
+    path: &skia_safe::Path,
+    paragraph: &Paragraph,
+    position: Point,
+    lift_offset: f32,
+    alpha: f32,
+) {
+    let lower_lift = lift_offset.floor();
+    let fraction = lift_offset - lower_lift;
+    if fraction <= f32::EPSILON {
+        let transform = canvas.save();
+        canvas.translate((0.0, -lower_lift));
+        paint_highlight_mask(canvas, path, paragraph, position, alpha);
+        canvas.restore_to_count(transform);
+        return;
+    }
+
+    let interpolation_layer = canvas.save_layer(&SaveLayerRec::default());
+    paint_weighted_lift_sample(
+        canvas,
+        path,
+        paragraph,
+        position,
+        lower_lift,
+        alpha,
+        1.0 - fraction,
+    );
+    paint_weighted_lift_sample(
+        canvas,
+        path,
+        paragraph,
+        position,
+        lower_lift + 1.0,
+        alpha,
+        fraction,
+    );
+    canvas.restore_to_count(interpolation_layer);
+}
+
+fn paint_weighted_lift_sample(
+    canvas: &Canvas,
+    path: &skia_safe::Path,
+    paragraph: &Paragraph,
+    position: Point,
+    lift: f32,
+    alpha: f32,
+    weight: f32,
+) {
+    let mut restore_paint = Paint::default();
+    restore_paint.set_alpha_f(weight);
+    restore_paint.set_blend_mode(BlendMode::Plus);
+    let sample_rec = SaveLayerRec::default().paint(&restore_paint);
+    let sample_layer = canvas.save_layer(&sample_rec);
+    canvas.translate((0.0, -lift));
+    paint_highlight_mask(canvas, path, paragraph, position, alpha);
+    canvas.restore_to_count(sample_layer);
 }
 
 fn paint_highlight_mask(
@@ -939,6 +1114,16 @@ fn word_progress(start_ms: u64, end_ms: u64, t_ms: u64) -> f64 {
     }
     let duration = end_ms.saturating_sub(start_ms).max(1) as f64;
     (t_ms.saturating_sub(start_ms) as f64 / duration).clamp(0.0, 1.0)
+}
+
+fn word_lift_progress(start_ms: u64, t_ms: u64) -> f64 {
+    if t_ms <= start_ms {
+        return 0.0;
+    }
+    (t_ms.saturating_sub(start_ms) as f64 / WORD_LIFT_DURATION_MS as f64).clamp(0.0, 1.0)
+}
+fn word_lift_offset(progress: f32, highlight_strength: f32, font_size: f32) -> f32 {
+    font_size * WORD_LIFT_EM * progress.clamp(0.0, 1.0) * highlight_strength.clamp(0.0, 1.0)
 }
 fn find_word_utf16_range(
     text: &str,
@@ -1219,6 +1404,61 @@ fn edge_opacity(top_y: f32, height: f32, active: bool) -> f32 {
 mod tests {
     use super::*;
 
+    fn timed_line() -> LyricLine {
+        LyricLine {
+            start_ms: 1_000,
+            end_ms: 2_000,
+            text: "Lyric".to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn word_lift_offset_tracks_fixed_duration_from_start() {
+        let font_size = 50.0;
+
+        assert_eq!(word_lift_progress(200, 200), 0.0);
+        assert_eq!(word_lift_progress(200, 800), 0.5);
+        assert_eq!(word_lift_progress(200, 1_400), 1.0);
+        assert_eq!(word_lift_progress(200, 2_000), 1.0);
+        assert_eq!(word_lift_offset(0.0, 1.0, font_size), 0.0);
+        assert!((word_lift_offset(1.0, 1.0, font_size) - font_size * 0.06).abs() < f32::EPSILON);
+        assert_eq!(word_lift_offset(1.0, 0.0, font_size), 0.0);
+    }
+
+    #[test]
+    fn highlight_strength_fades_out_after_line_end() {
+        let line = timed_line();
+
+        assert_eq!(highlight_strength(&line, false, 1.0, 2_000), 1.0);
+        assert_eq!(highlight_strength(&line, false, 1.0, 2_070), 0.5);
+        assert_eq!(highlight_strength(&line, false, 1.0, 2_140), 0.0);
+        assert_eq!(highlight_strength(&line, false, 1.0, 1_500), 0.0);
+    }
+
+    #[test]
+    fn highlight_strength_preserves_fade_in() {
+        let line = timed_line();
+
+        assert_eq!(highlight_strength(&line, true, 1.0, 1_000), 0.0);
+        assert_eq!(highlight_strength(&line, true, 1.0, 1_070), 0.5);
+        assert_eq!(highlight_strength(&line, true, 1.0, 1_140), 1.0);
+    }
+
+    #[test]
+    fn background_highlight_fades_out_after_its_own_end() {
+        let line = timed_line();
+
+        assert_eq!(background_highlight_strength(&line, 1.0, 2_000), 1.0);
+        assert_eq!(background_highlight_strength(&line, 1.0, 2_070), 0.5);
+        assert_eq!(background_highlight_strength(&line, 1.0, 2_140), 0.0);
+        assert_eq!(background_highlight_strength(&line, 1.0, 999), 0.0);
+    }
     #[test]
     fn maps_cjk_and_emoji_to_utf16_offsets() {
         let text = "你 😀 hi";
@@ -1360,6 +1600,262 @@ mod tests {
         let mut pixels = vec![0; info.compute_byte_size(row_bytes)];
         assert!(surface.read_pixels(&info, &mut pixels, row_bytes, IPoint::new(0, 0),));
         pixels.chunks_exact(4).filter(|pixel| pixel[3] != 0).count()
+    }
+
+    fn render_timed_word_line(
+        renderer: &LyricsRenderer,
+        line: &LyricLine,
+        t_ms: u64,
+        active: bool,
+    ) -> (Vec<u8>, usize, usize) {
+        use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
+
+        let dimensions = (600, 300);
+        let mut surface = surfaces::raster_n32_premul(dimensions).unwrap();
+        surface.canvas().clear(Color::TRANSPARENT);
+        draw_line(
+            surface.canvas(),
+            &renderer.base_paragraphs[0],
+            &renderer.solid_paragraphs[0],
+            &renderer.word_boxes[0],
+            None,
+            line,
+            active,
+            1.0,
+            t_ms,
+            renderer.margin_x,
+            renderer.text_width,
+            100.0,
+            renderer.main_font_size,
+            renderer.style.translation_gap_scale,
+        );
+        let info = ImageInfo::new(dimensions, ColorType::RGBA8888, AlphaType::Premul, None);
+        let row_bytes = dimensions.0 as usize * 4;
+        let mut pixels = vec![0; info.compute_byte_size(row_bytes)];
+        assert!(surface.read_pixels(&info, &mut pixels, row_bytes, IPoint::new(0, 0)));
+        (pixels, dimensions.0 as usize, dimensions.1 as usize)
+    }
+
+    fn alpha_weighted_y_centroid(
+        pixels: &[u8],
+        width: usize,
+        height: usize,
+        x_start: usize,
+        x_end: usize,
+    ) -> f64 {
+        let mut weighted_y = 0.0;
+        let mut total_alpha = 0.0;
+        for y in 0..height {
+            for x in x_start..x_end {
+                let alpha = pixels[(y * width + x) * 4 + 3] as f64;
+                weighted_y += y as f64 * alpha;
+                total_alpha += alpha;
+            }
+        }
+        assert!(total_alpha > 0.0);
+        weighted_y / total_alpha
+    }
+
+    fn topmost_pixel_in_x_range(
+        pixels: &[u8],
+        width: usize,
+        height: usize,
+        x_start: usize,
+        x_end: usize,
+        minimum_alpha: u8,
+    ) -> Option<usize> {
+        (0..height)
+            .find(|&y| (x_start..x_end).any(|x| pixels[(y * width + x) * 4 + 3] >= minimum_alpha))
+    }
+
+    fn premultiplied_color_totals(
+        pixels: &[u8],
+        width: usize,
+        height: usize,
+        x_start: usize,
+        x_end: usize,
+    ) -> (u64, u64) {
+        let mut rgb = 0_u64;
+        let mut alpha = 0_u64;
+        for y in 0..height {
+            for x in x_start..x_end {
+                let pixel = &pixels[(y * width + x) * 4..][..4];
+                rgb += u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]);
+                alpha += u64::from(pixel[3]);
+            }
+        }
+        (rgb, alpha)
+    }
+
+    #[test]
+    fn timed_word_moves_for_fixed_duration_from_start() {
+        use crate::lrc::LyricWord;
+
+        let line = LyricLine {
+            start_ms: 0,
+            end_ms: 3_000,
+            text: "Alpha Beta".to_owned(),
+            translation: None,
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: vec![
+                LyricWord {
+                    start_ms: 200,
+                    end_ms: 1_000,
+                    text: "Alpha".to_owned(),
+                },
+                LyricWord {
+                    start_ms: 1_600,
+                    end_ms: 2_600,
+                    text: "Beta".to_owned(),
+                },
+            ],
+        };
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let renderer = LyricsRenderer::new(std::slice::from_ref(&line), viewport).unwrap();
+        let word_x_ranges = renderer.word_boxes[0]
+            .iter()
+            .map(|boxes| {
+                let left = boxes
+                    .iter()
+                    .map(|text_box| text_box.rect.left())
+                    .fold(f32::INFINITY, f32::min);
+                let right = boxes
+                    .iter()
+                    .map(|text_box| text_box.rect.right())
+                    .fold(f32::NEG_INFINITY, f32::max);
+                (
+                    (renderer.margin_x + left).floor().max(0.0) as usize,
+                    (renderer.margin_x + right).ceil().min(viewport.width) as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(word_x_ranges.len(), 2);
+
+        let (base_pixels, width, height) = render_timed_word_line(&renderer, &line, 0, false);
+        let (subpixel_before_pixels, _, _) = render_timed_word_line(&renderer, &line, 1_000, true);
+        let (subpixel_after_pixels, _, _) = render_timed_word_line(&renderer, &line, 1_020, true);
+        let subpixel_before = alpha_weighted_y_centroid(
+            &subpixel_before_pixels,
+            width,
+            height,
+            word_x_ranges[0].0,
+            word_x_ranges[0].1,
+        );
+        let subpixel_after = alpha_weighted_y_centroid(
+            &subpixel_after_pixels,
+            width,
+            height,
+            word_x_ranges[0].0,
+            word_x_ranges[0].1,
+        );
+        assert!(
+            subpixel_after < subpixel_before && subpixel_before - subpixel_after < 1.0,
+            "adjacent frames must preserve fractional vertical motion: before={subpixel_before}, \
+             after={subpixel_after}"
+        );
+        let (before_rgb, before_alpha) = premultiplied_color_totals(
+            &subpixel_before_pixels,
+            width,
+            height,
+            word_x_ranges[0].0,
+            word_x_ranges[0].1,
+        );
+        let (after_rgb, after_alpha) = premultiplied_color_totals(
+            &subpixel_after_pixels,
+            width,
+            height,
+            word_x_ranges[0].0,
+            word_x_ranges[0].1,
+        );
+        let before_ratio = before_rgb as f64 / before_alpha as f64;
+        let after_ratio = after_rgb as f64 / after_alpha as f64;
+        assert!(
+            (before_ratio - after_ratio).abs() < 0.01,
+            "subpixel interpolation must preserve premultiplied color ratio: \
+             before={before_ratio}, after={after_ratio}"
+        );
+        let (first_start_pixels, _, _) = render_timed_word_line(&renderer, &line, 200, true);
+        let (first_lifting_pixels, _, _) = render_timed_word_line(&renderer, &line, 800, true);
+        let (first_complete_pixels, _, _) = render_timed_word_line(&renderer, &line, 1_400, true);
+        let (second_start_pixels, _, _) = render_timed_word_line(&renderer, &line, 1_600, true);
+        let (second_lifting_pixels, _, _) = render_timed_word_line(&renderer, &line, 2_200, true);
+        let (second_complete_pixels, _, _) = render_timed_word_line(&renderer, &line, 2_800, true);
+        let top = |pixels: &[u8], range: (usize, usize), minimum_alpha| {
+            topmost_pixel_in_x_range(pixels, width, height, range.0, range.1, minimum_alpha)
+                .expect("word range should contain rendered pixels")
+        };
+
+        let first_base_top = top(&base_pixels, word_x_ranges[0], 1);
+        let first_start_top = top(&first_start_pixels, word_x_ranges[0], 1);
+        let first_lifting_center = alpha_weighted_y_centroid(
+            &first_lifting_pixels,
+            width,
+            height,
+            word_x_ranges[0].0,
+            word_x_ranges[0].1,
+        );
+        let first_complete_center = alpha_weighted_y_centroid(
+            &first_complete_pixels,
+            width,
+            height,
+            word_x_ranges[0].0,
+            word_x_ranges[0].1,
+        );
+        assert_eq!(
+            first_start_top, first_base_top,
+            "word must begin lifting from its baseline at start_ms"
+        );
+        assert!(
+            first_complete_center < first_lifting_center,
+            "whole word should rise over fixed 1200ms: complete={first_complete_center}, \
+             lifting={first_lifting_center}"
+        );
+        assert!(
+            topmost_pixel_in_x_range(
+                &first_lifting_pixels,
+                width,
+                height,
+                word_x_ranges[1].0,
+                word_x_ranges[1].1,
+                240,
+            )
+            .is_none(),
+            "future second word must not have white highlight pixels"
+        );
+
+        let second_base_top = top(&base_pixels, word_x_ranges[1], 1);
+        let second_start_top = top(&second_start_pixels, word_x_ranges[1], 1);
+        let second_lifting_center = alpha_weighted_y_centroid(
+            &second_lifting_pixels,
+            width,
+            height,
+            word_x_ranges[1].0,
+            word_x_ranges[1].1,
+        );
+        let second_complete_center = alpha_weighted_y_centroid(
+            &second_complete_pixels,
+            width,
+            height,
+            word_x_ranges[1].0,
+            word_x_ranges[1].1,
+        );
+        assert_eq!(
+            second_start_top, second_base_top,
+            "second word must begin lifting from its baseline at start_ms"
+        );
+        assert!(
+            second_complete_center < second_lifting_center,
+            "second word should finish after fixed 1200ms: complete={second_complete_center}, \
+             lifting={second_lifting_center}"
+        );
     }
 
     #[test]
@@ -1624,5 +2120,18 @@ mod tests {
     #[test]
     fn debug_overlays_are_opt_in() {
         assert!(!LyricsStyle::default().debug_overlays);
+    }
+}
+
+#[cfg(test)]
+mod blur_parameter_tests {
+    use super::{LYRIC_BLUR_LEVELS, lyric_blur_sigma};
+
+    #[test]
+    fn lyric_blur_sigma_caps_at_seven_steps() {
+        assert_eq!(lyric_blur_sigma(0, 6), 0);
+        assert_eq!(lyric_blur_sigma(3, 6), 18);
+        assert_eq!(lyric_blur_sigma(7, 6), 42);
+        assert_eq!(lyric_blur_sigma(20, 6), LYRIC_BLUR_LEVELS * 6);
     }
 }
